@@ -28,6 +28,8 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/authzed/spicedb/pkg/spiceerrors"
 )
 
 // ---------------------------------------------------------------------------
@@ -131,14 +133,10 @@ func canonicalize(s pgSnapshot) pgSnapshot {
 func snapshotSortKey(s pgSnapshot) []byte {
 	c := canonicalize(s)
 
-	if len(c.xipList) > math.MaxUint32 {
-		panic("xipList too long to encode")
-	}
-
 	key := make([]byte, 0, 20+8*len(c.xipList))
 	key = binary.BigEndian.AppendUint64(key, visibleCardinality(s))
 	key = binary.BigEndian.AppendUint64(key, c.xmax)
-	key = binary.BigEndian.AppendUint32(key, uint32(len(c.xipList)))
+	key = binary.BigEndian.AppendUint32(key, spiceerrors.MustSafecast[uint32](len(c.xipList)))
 	for _, x := range c.xipList {
 		key = binary.BigEndian.AppendUint64(key, x)
 	}
@@ -300,7 +298,7 @@ func fixtureSnapshots() []pgSnapshot {
 // same cardinality but different visible sets, Equal-but-not-identical representations, empty
 // and dense xipLists, and xmin == xmax.
 func adversarialSnapshots() []pgSnapshot {
-	out := []pgSnapshot{}
+	out := make([]pgSnapshot, 0, 64)
 
 	// Same cardinality, different visible set - forces the tiebreaker to do real work.
 	for hidden := range uint64(8) {
@@ -348,7 +346,9 @@ const randomSeed = 0x5EED5C0DEBA5E
 // on purpose: with xmax in [0, 24) distinct snapshots collide often, which is the only way the
 // concurrent and Equal branches of compare get exercised at a useful rate.
 func randomSnapshots(count int) []pgSnapshot {
-	rng := rand.New(rand.NewPCG(randomSeed, 0x9E3779B97F4A7C15))
+	// A fixed seed is the whole point: a failure here must be reproducible by rerunning the test
+	// unchanged, which a cryptographic source would defeat.
+	rng := rand.New(rand.NewPCG(randomSeed, 0x9E3779B97F4A7C15)) //nolint:gosec
 
 	out := make([]pgSnapshot, 0, count)
 	for range count {
@@ -445,8 +445,9 @@ func TestCompareIsAStrictPartialOrder(t *testing.T) {
 	snapshots = append(snapshots, randomSnapshots(120)...)
 
 	for _, a := range snapshots {
-		require.True(t, a.Equal(a), "compare is not reflexive at %s", a)
-		require.False(t, a.LessThan(a), "compare is not irreflexive at %s", a)
+		same := a
+		require.True(t, a.Equal(same), "compare is not reflexive at %s", a)
+		require.False(t, a.LessThan(same), "compare is not irreflexive at %s", a)
 	}
 
 	for _, a := range snapshots {
@@ -490,7 +491,7 @@ func TestVisibleCardinalityMatchesBruteForce(t *testing.T) {
 		if s.xmax > bruteForceUniverse {
 			continue
 		}
-		want := uint64(bits.OnesCount64(bruteForceVisibleSet(t, s)))
+		want := spiceerrors.MustSafecast[uint64](bits.OnesCount64(bruteForceVisibleSet(t, s)))
 		require.Equal(t, want, visibleCardinality(s), "cardinality of %s", s)
 	}
 }
@@ -553,6 +554,29 @@ func TestNaiveCardinalityFormulaBreaksOnIllFormedSnapshots(t *testing.T) {
 		require.False(t, ok, "naive formula would underflow to a huge uint64")
 		require.EqualValues(t, 1, visibleCardinality(s))
 	})
+}
+
+// TestCanonicalizationMakesTheNaiveFormulaCorrect records a simplification found by mutation
+// testing this file: replacing visibleCardinality(s) with the naive c.xmax - len(c.xipList) over
+// the CANONICAL form breaks nothing, because canonicalize has already dropped out-of-range
+// entries and duplicates.
+//
+// The two are interchangeable in snapshotSortKey. visibleCardinality is kept because it states
+// the intent directly and does not silently depend on canonicalize running first, but anyone
+// implementing this for real should know the cheap version is sufficient.
+func TestCanonicalizationMakesTheNaiveFormulaCorrect(t *testing.T) {
+	snapshots := allTestSnapshots()
+	snapshots = append(snapshots,
+		snap(5, 10, 3), // entry below xmin
+		pgSnapshot{xmin: 3, xmax: 10, xipList: []uint64{3, 3, 4}}, // duplicate
+		pgSnapshot{xmin: 0, xmax: 1, xipList: []uint64{5, 6, 7}},  // entries above xmax
+	)
+
+	for _, s := range snapshots {
+		c := canonicalize(s)
+		require.Equal(t, visibleCardinality(s), c.xmax-uint64(len(c.xipList)),
+			"canonical naive formula disagrees for %s (canonical %s)", s, c)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -667,7 +691,8 @@ func TestSortKeyOrderIsAStrictTotalOrder(t *testing.T) {
 	}
 
 	for i := range snapshots {
-		require.Zero(t, bytes.Compare(keys[i], keys[i]), "key order is not reflexive at %s", snapshots[i])
+		require.Zero(t, bytes.Compare(keys[i], slices.Clone(keys[i])),
+			"key order is not reflexive at %s", snapshots[i])
 	}
 
 	for i, a := range snapshots {
@@ -832,7 +857,7 @@ func TestKeyLengthIsDeterminedByItsHeader(t *testing.T) {
 		key := snapshotSortKey(s)
 		header := string(key[:16])
 		if seen, ok := byHeader[header]; ok {
-			require.Equal(t, seen, len(key),
+			require.Len(t, key, seen,
 				"two keys share a header but differ in length, prefix-freedom is not structural")
 		}
 		byHeader[header] = len(key)
@@ -895,7 +920,7 @@ func TestIllFormedSnapshotsBreakCompareItself(t *testing.T) {
 // TestMutatorsPreserveWellFormedness establishes that the ill-formed case above is unreachable
 // from the code paths that actually produce snapshots at runtime.
 func TestMutatorsPreserveWellFormedness(t *testing.T) {
-	rng := rand.New(rand.NewPCG(randomSeed, 0xBF58476D1CE4E5B9))
+	rng := rand.New(rand.NewPCG(randomSeed, 0xBF58476D1CE4E5B9)) //nolint:gosec // deterministic by design
 
 	for _, start := range append(exhaustiveSmallSnapshots(5), randomSnapshots(150)...) {
 		require.True(t, wellFormed(start), "generator produced an ill-formed snapshot %s", start)
@@ -943,12 +968,13 @@ func TestRevisionSortKeyIsALinearExtension(t *testing.T) {
 
 	revisions := make([]postgresRevision, 0, len(snapshots))
 	for i, s := range snapshots {
+		// Deliberately varied, and deliberately anti-correlated with the snapshot order, to prove
+		// the key ignores both fields.
+		noise := spiceerrors.MustSafecast[uint64](len(snapshots) - i)
 		revisions = append(revisions, postgresRevision{
-			snapshot: s,
-			// Deliberately varied, and deliberately not correlated with the snapshot order, to
-			// prove the key ignores them.
-			optionalTxID:                  xid8{Uint64: uint64(len(snapshots) - i), Valid: true},
-			optionalInexactNanosTimestamp: uint64(len(snapshots) - i),
+			snapshot:                      s,
+			optionalTxID:                  xid8{Uint64: noise, Valid: true},
+			optionalInexactNanosTimestamp: noise,
 		})
 	}
 
