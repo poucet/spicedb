@@ -36,55 +36,6 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Research scaffolding: the variable-width key, which is NOT what ships
-// ---------------------------------------------------------------------------
-
-// snapshotSortKey is the FIRST candidate, kept only as the evidence base for the shipping one.
-// It is not production code and nothing calls it outside this file. The production key is
-// postgresRevision.AppendSortKey in sortkey.go, which is fixed width; this one grows with the
-// number of in-flight transactions and reached 4020 bytes on a 500-transaction snapshot, which
-// is what ruled it out.
-//
-// It earns its keep by carrying the findings that explain the shape of the production key:
-// canonical xmax is monotone where raw xmax is not, and prefix-freedom is structural rather than
-// a property of the length field. Delete it only together with those tests.
-//
-// Bytes that sort as a linear extension of compare:
-//
-//	[8 bytes BE] visible-set cardinality   - monotone, carries the order
-//	[8 bytes BE] canonical xmax            - also monotone, breaks ties
-//	[4 bytes BE] canonical len(xipList)    - redundant; see below
-//	[8 bytes BE] * N  canonical xipList    - breaks the remaining ties, ascending
-//
-// Two notes, both established by mutation testing this file rather than by reasoning:
-//
-// Cardinality does NOT have to come first. Canonical xmax is monotone too - canonicalize pins it
-// to one past the highest settled transaction, so a strict subset of visible transactions can
-// only lower it - and swapping the first two fields still yields a valid linear extension
-// (TestCanonicalXmaxIsMonotoneButRawXmaxIsNot). RAW xmax is not monotone, which is the easy
-// mistake: snap(0,10,0..9) sees nothing and is LessThan snap(0,4,2), yet has the larger raw xmax.
-// It canonicalizes to snap(0,0), so the trap is avoided by canonicalizing, not by field order.
-//
-// The length prefix is redundant. Cardinality is canonical xmax minus the entry count, so any two
-// of the three determine the third, and keys that agree on the first sixteen bytes already have
-// equal length. It is kept because a real implementation should not make a reader derive its
-// framing, and because removing it makes prefix-freedom depend on an invariant three fields away
-// (TestKeyLengthIsDeterminedByItsHeader).
-func snapshotSortKey(s pgSnapshot) []byte {
-	c := canonicalize(s)
-
-	key := make([]byte, 0, 20+8*len(c.xipList))
-	key = binary.BigEndian.AppendUint64(key, visibleCardinality(s))
-	key = binary.BigEndian.AppendUint64(key, c.xmax)
-	key = binary.BigEndian.AppendUint32(key, spiceerrors.MustSafecast[uint32](len(c.xipList)))
-	for _, x := range c.xipList {
-		key = binary.BigEndian.AppendUint64(key, x)
-	}
-
-	return key
-}
-
-// ---------------------------------------------------------------------------
 // The production key
 // ---------------------------------------------------------------------------
 
@@ -526,9 +477,9 @@ func TestNaiveCardinalityFormulaBreaksOnIllFormedSnapshots(t *testing.T) {
 // the CANONICAL form breaks nothing, because canonicalize has already dropped out-of-range
 // entries and duplicates.
 //
-// The two are interchangeable in snapshotSortKey. visibleCardinality is kept because it states
-// the intent directly and does not silently depend on canonicalize running first, but anyone
-// implementing this for real should know the cheap version is sufficient.
+// The two are interchangeable wherever the canonical form is already in hand. visibleCardinality
+// is what production uses, because it states the intent directly and does not silently depend on
+// canonicalize having run first.
 func TestCanonicalizationMakesTheNaiveFormulaCorrect(t *testing.T) {
 	snapshots := allTestSnapshots()
 	snapshots = append(snapshots,
@@ -591,140 +542,23 @@ func TestCanonicalizeCollapsesEqualButNotIdenticalSnapshots(t *testing.T) {
 			require.True(t, p.a.Equal(p.b), "fixture is not actually Equal")
 			require.NotEqual(t, p.a, p.b, "fixture is identical, so it proves nothing")
 			require.Equal(t, canonicalize(p.a), canonicalize(p.b), "normal forms differ")
-			require.Equal(t, snapshotSortKey(p.a), snapshotSortKey(p.b), "sort keys differ")
+			require.Equal(t, compactSortKey(p.a), compactSortKey(p.b), "sort keys differ")
 		})
 	}
-}
-
-// ---------------------------------------------------------------------------
-// The three required properties
-// ---------------------------------------------------------------------------
-
-// TestSortKeyIsALinearExtension is the headline test. Every ordered pair in the corpus is checked
-// against all three requirements.
-func TestSortKeyIsALinearExtension(t *testing.T) {
-	snapshots := allTestSnapshots()
-	keys := make([][]byte, len(snapshots))
-	for i, s := range snapshots {
-		keys[i] = snapshotSortKey(s)
-	}
-
-	var pairs, ltPairs, eqPairs, concurrentPairs int
-	for i, a := range snapshots {
-		for j, b := range snapshots {
-			pairs++
-			cmp := bytes.Compare(keys[i], keys[j])
-
-			switch a.compare(b) {
-			case lt:
-				ltPairs++
-				require.Negative(t, cmp,
-					"LessThan but key not less:\n  a = %s key=%x\n  b = %s key=%x", a, keys[i], b, keys[j])
-			case gt:
-				require.Positive(t, cmp,
-					"GreaterThan but key not greater:\n  a = %s key=%x\n  b = %s key=%x", a, keys[i], b, keys[j])
-			case equal:
-				eqPairs++
-				require.Zero(t, cmp,
-					"Equal but keys differ:\n  a = %s key=%x\n  b = %s key=%x", a, keys[i], b, keys[j])
-			case concurrent:
-				concurrentPairs++
-				require.NotZero(t, cmp,
-					"concurrent but keys collide, so the order is not total:\n  a = %s\n  b = %s", a, b)
-			default:
-				t.Fatalf("unexpected comparison result for %s and %s", a, b)
-			}
-		}
-	}
-
-	t.Logf("seed=%#x snapshots=%d pairs=%d (lt/gt=%d equal=%d concurrent=%d)",
-		randomSeed, len(snapshots), pairs, ltPairs*2, eqPairs, concurrentPairs)
-
-	require.Positive(t, ltPairs, "corpus produced no ordered pairs, the test proves nothing")
-	require.Positive(t, concurrentPairs, "corpus produced no concurrent pairs, the hard case is untested")
-	require.Positive(t, eqPairs, "corpus produced no Equal pairs")
-}
-
-// TestSortKeyOrderIsAStrictTotalOrder checks the derived order is well behaved in its own right,
-// independent of compare: irreflexive, antisymmetric, transitive, and total once Equal snapshots
-// are identified.
-func TestSortKeyOrderIsAStrictTotalOrder(t *testing.T) {
-	snapshots := allTestSnapshots()
-	keys := make([][]byte, len(snapshots))
-	for i, s := range snapshots {
-		keys[i] = snapshotSortKey(s)
-	}
-
-	for i := range snapshots {
-		require.Zero(t, bytes.Compare(keys[i], slices.Clone(keys[i])),
-			"key order is not reflexive at %s", snapshots[i])
-	}
-
-	for i, a := range snapshots {
-		for j, b := range snapshots {
-			ij := bytes.Compare(keys[i], keys[j])
-			ji := bytes.Compare(keys[j], keys[i])
-			require.Equal(t, ij, -ji, "key order is not antisymmetric for %s, %s", a, b)
-			require.Equal(t, ij == 0, a.Equal(b),
-				"keys tie iff Equal is violated for %s, %s", a, b)
-		}
-	}
-
-	// Transitivity of a lexicographic byte order is a mathematical fact, but a cycle would show
-	// up here if the key were not a pure function, so a bounded sweep is still worth running.
-	sample := snapshots
-	if len(sample) > 90 {
-		sample = sample[:90]
-	}
-	for i := range sample {
-		for j := range sample {
-			if bytes.Compare(keys[i], keys[j]) >= 0 {
-				continue
-			}
-			for k := range sample {
-				if bytes.Compare(keys[j], keys[k]) >= 0 {
-					continue
-				}
-				require.Negative(t, bytes.Compare(keys[i], keys[k]),
-					"key order is not transitive: %s < %s < %s", sample[i], sample[j], sample[k])
-			}
-		}
-	}
-}
-
-// TestSortedOrderNeverContradictsThePartialOrder sorts the whole corpus by key and then checks
-// every pair in the resulting sequence. This is the property a caller actually depends on, and it
-// is where a bad tiebreaker surfaces as an element appearing before something it is GreaterThan.
-func TestSortedOrderNeverContradictsThePartialOrder(t *testing.T) {
-	snapshots := allTestSnapshots()
-
-	sorted := slices.Clone(snapshots)
-	slices.SortStableFunc(sorted, func(a, b pgSnapshot) int {
-		return bytes.Compare(snapshotSortKey(a), snapshotSortKey(b))
-	})
-
-	for i := range sorted {
-		for j := i + 1; j < len(sorted); j++ {
-			require.False(t, sorted[i].GreaterThan(sorted[j]),
-				"sorted position %d holds %s which is GreaterThan %s at position %d",
-				i, sorted[i], sorted[j], j)
-		}
-	}
-	t.Logf("sorted %d snapshots, no inversion against the partial order", len(sorted))
 }
 
 // ---------------------------------------------------------------------------
 // Key hygiene
 // ---------------------------------------------------------------------------
 
-// TestSortKeyIsDeterministicAndContextFree checks the key depends only on the snapshot's own
+// TestCompactKeyIsDeterministicAndContextFree checks the key depends only on the snapshot's own
 // fields, so it is stable as the database advances and does not depend on which other snapshots
 // happen to be present.
-func TestSortKeyIsDeterministicAndContextFree(t *testing.T) {
+func TestCompactKeyIsDeterministicAndContextFree(t *testing.T) {
 	for _, s := range allTestSnapshots() {
-		first := snapshotSortKey(s)
+		first := compactSortKey(s)
 		for range 3 {
-			require.Equal(t, first, snapshotSortKey(s), "key is not deterministic for %s", s)
+			require.Equal(t, first, compactSortKey(s), "key is not deterministic for %s", s)
 		}
 
 		// A different representation of the same snapshot, reached by a round trip through the
@@ -733,24 +567,37 @@ func TestSortKeyIsDeterministicAndContextFree(t *testing.T) {
 		require.NoError(t, err)
 		var reparsed pgSnapshot
 		require.NoError(t, reparsed.ScanText(text))
-		require.Equal(t, first, snapshotSortKey(reparsed),
+		require.Equal(t, first, compactSortKey(reparsed),
 			"key changed across a text round trip for %s", s)
 	}
 }
 
-// TestSortKeyIsPrefixFree checks that no key is a prefix of another, so a snapshot key can be one
-// field of a longer composite key without the surrounding bytes reordering it. This is the same
-// guarantee datastore.SortKeyRevision.AppendSortKey makes.
-func TestSortKeyIsPrefixFree(t *testing.T) {
+// TestCompactKeyIsPrefixFree checks that no key is a proper prefix of another, so a snapshot key
+// can be one field of a longer composite key without the surrounding bytes reordering it. This
+// is one of the guarantees datastore.SortKeyRevision.AppendSortKey makes.
+//
+// For a fixed-width key this is structural rather than incidental, and the test says so by
+// asserting the width FIRST. A loop that only looks for prefixes would pass vacuously here - no
+// key is ever shorter than another, so there is nothing for it to examine - and would keep
+// passing if the key ever became variable width. Pinning the width is what gives it teeth.
+func TestCompactKeyIsPrefixFree(t *testing.T) {
 	snapshots := allTestSnapshots()
+
+	for _, s := range snapshots {
+		require.Len(t, compactSortKey(s), sortKeyLength,
+			"prefix-freedom here rests on every key being the same width; %s broke that", s)
+	}
+
+	// Equal width makes a proper prefix impossible, so the only way to be a prefix is to be
+	// equal, which only Equal snapshots may be.
 	for _, a := range snapshots {
 		for _, b := range snapshots {
-			ka, kb := snapshotSortKey(a), snapshotSortKey(b)
-			if len(ka) >= len(kb) {
-				continue
+			ka, kb := compactSortKey(a), compactSortKey(b)
+			if bytes.HasPrefix(kb, ka) {
+				require.Equal(t, ka, kb)
+				require.False(t, a.LessThan(b) || a.GreaterThan(b),
+					"keys of the comparable pair %s and %s are prefixes of one another", a, b)
 			}
-			require.False(t, bytes.HasPrefix(kb, ka),
-				"key of %s is a proper prefix of key of %s", a, b)
 		}
 	}
 }
@@ -758,6 +605,11 @@ func TestSortKeyIsPrefixFree(t *testing.T) {
 // TestCanonicalXmaxIsMonotoneButRawXmaxIsNot separates the two, because conflating them is what
 // makes the naive "just sort by xmax" idea look broken when the real culprit is the missing
 // canonicalization.
+//
+// This is a property of canonicalize, not of any particular key, which is why it outlived the
+// variable-width key it was originally written for. It is also the reason the production key can
+// put cardinality first without worrying: both fields move the same way, so the choice between
+// them is free rather than load-bearing.
 func TestCanonicalXmaxIsMonotoneButRawXmaxIsNot(t *testing.T) {
 	t.Run("raw xmax is not monotone", func(t *testing.T) {
 		low := snap(0, 10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9) // sees nothing
@@ -783,70 +635,6 @@ func TestCanonicalXmaxIsMonotoneButRawXmaxIsNot(t *testing.T) {
 		t.Logf("canonical xmax non-decreasing across %d ordered pairs", checked)
 	})
 
-	t.Run("swapping the first two fields is still a linear extension", func(t *testing.T) {
-		// The alternative key, to show the design has slack rather than being load-bearing.
-		altKey := func(s pgSnapshot) []byte {
-			c := canonicalize(s)
-			key := binary.BigEndian.AppendUint64(nil, c.xmax)
-			key = binary.BigEndian.AppendUint64(key, visibleCardinality(s))
-			for _, x := range c.xipList {
-				key = binary.BigEndian.AppendUint64(key, x)
-			}
-			return key
-		}
-
-		snapshots := allTestSnapshots()
-		for _, a := range snapshots {
-			for _, b := range snapshots {
-				cmp := bytes.Compare(altKey(a), altKey(b))
-				switch a.compare(b) {
-				case lt:
-					require.Negative(t, cmp, "%s < %s", a, b)
-				case gt:
-					require.Positive(t, cmp, "%s > %s", a, b)
-				case equal:
-					require.Zero(t, cmp, "%s == %s", a, b)
-				case concurrent:
-					require.NotZero(t, cmp, "%s ~ %s", a, b)
-				}
-			}
-		}
-	})
-}
-
-// TestKeyLengthIsDeterminedByItsHeader is why prefix-freedom holds. Two keys sharing their first
-// sixteen bytes necessarily have the same length, so neither can be a proper prefix of the other.
-func TestKeyLengthIsDeterminedByItsHeader(t *testing.T) {
-	byHeader := map[string]int{}
-	for _, s := range allTestSnapshots() {
-		key := snapshotSortKey(s)
-		header := string(key[:16])
-		if seen, ok := byHeader[header]; ok {
-			require.Len(t, key, seen,
-				"two keys share a header but differ in length, prefix-freedom is not structural")
-		}
-		byHeader[header] = len(key)
-	}
-}
-
-// TestSortKeySizeIsUnbounded records the practical cost, which is the main argument against
-// embedding this key in a ZedToken. The key carries the canonical xipList, so it grows with the
-// number of concurrently open write transactions.
-func TestSortKeySizeIsUnbounded(t *testing.T) {
-	require.Len(t, snapshotSortKey(snap(5, 5)), 20, "the empty case is small")
-
-	inProgress := make([]uint64, 0, 500)
-	for i := range uint64(1000) {
-		if i%2 == 0 {
-			inProgress = append(inProgress, i)
-		}
-	}
-	big := makeWellFormed(1000, inProgress)
-	key := snapshotSortKey(big)
-	require.Len(t, key, 20+8*len(big.xipList))
-	t.Logf("a snapshot with %d in-progress transactions produces a %d byte key",
-		len(big.xipList), len(key))
-	require.Greater(t, len(key), 4000, "unbounded growth is the point of this test")
 }
 
 // ---------------------------------------------------------------------------
@@ -879,7 +667,7 @@ func TestIllFormedSnapshotsBreakCompareItself(t *testing.T) {
 		"expected the known inconsistency; if this now reports equal, compare was fixed")
 
 	// So the sort key, which is computed from the visible set, cannot agree with compare here.
-	require.Equal(t, snapshotSortKey(ill), snapshotSortKey(ok))
+	require.Equal(t, compactSortKey(ill), compactSortKey(ok))
 }
 
 // TestMutatorsPreserveWellFormedness establishes that the ill-formed case above is unreachable
@@ -906,16 +694,16 @@ func TestMutatorsPreserveWellFormedness(t *testing.T) {
 	}
 }
 
-// TestMarkCompleteIsMonotoneInTheSortKey checks the thing a caller is most likely to assume: that
+// TestMarkCompleteIsMonotoneInTheCompactKey checks the thing a caller is most likely to assume: that
 // committing another transaction moves the key forward, never backward.
-func TestMarkCompleteIsMonotoneInTheSortKey(t *testing.T) {
+func TestMarkCompleteIsMonotoneInTheCompactKey(t *testing.T) {
 	for _, s := range append(exhaustiveSmallSnapshots(5), fixtureSnapshots()...) {
 		if s.xmax > 1<<40 {
 			continue // markComplete would materialize an enormous xipList
 		}
 		for txid := range uint64(12) {
 			next := s.markComplete(txid)
-			require.LessOrEqual(t, bytes.Compare(snapshotSortKey(s), snapshotSortKey(next)), 0,
+			require.LessOrEqual(t, bytes.Compare(compactSortKey(s), compactSortKey(next)), 0,
 				"markComplete(%d) moved the key backward: %s -> %s", txid, s, next)
 		}
 	}
@@ -1032,8 +820,8 @@ func TestCompactKeyIsFixedWidth(t *testing.T) {
 
 	require.Len(t, big.xipList, 500)
 	require.Len(t, compactSortKey(big), sortKeyLength)
-	t.Logf("%d in-progress transactions: variable key %d bytes, compact key %d bytes",
-		len(big.xipList), len(snapshotSortKey(big)), len(compactSortKey(big)))
+	t.Logf("%d in-progress transactions still key to %d bytes",
+		len(big.xipList), len(compactSortKey(big)))
 }
 
 // TestCompactKeyEqualSnapshotsHashIdentically is the sharp case: Equal snapshots with different
@@ -1350,7 +1138,7 @@ func TestRevisionSortKeyIsALinearExtension(t *testing.T) {
 
 	for _, a := range revisions {
 		for _, b := range revisions {
-			cmp := bytes.Compare(snapshotSortKey(a.snapshot), snapshotSortKey(b.snapshot))
+			cmp := bytes.Compare(compactSortKey(a.snapshot), compactSortKey(b.snapshot))
 			switch {
 			case a.LessThan(b):
 				require.Negative(t, cmp, "revision %s < %s", a.snapshot, b.snapshot)
@@ -1382,7 +1170,7 @@ func TestCommitTimestampCannotBeUsedAsATiebreaker(t *testing.T) {
 	require.False(t, late.GreaterThan(early))
 
 	// The snapshot-derived key respects that. A timestamp-derived one would not.
-	require.Equal(t, snapshotSortKey(early.snapshot), snapshotSortKey(late.snapshot))
+	require.Equal(t, compactSortKey(early.snapshot), compactSortKey(late.snapshot))
 
 	timestampKey := func(pr postgresRevision) []byte {
 		return binary.BigEndian.AppendUint64(nil, pr.optionalInexactNanosTimestamp)
@@ -1423,7 +1211,7 @@ func TestZedTokenAlreadyCarriesEnoughToComputeTheKey(t *testing.T) {
 		parsed, ok := parsedRaw.(postgresRevision)
 		require.True(t, ok)
 
-		require.Equal(t, snapshotSortKey(s), snapshotSortKey(parsed.snapshot),
+		require.Equal(t, compactSortKey(s), compactSortKey(parsed.snapshot),
 			"sort key not recoverable from the encoded revision for %s", s)
 		require.True(t, original.Equal(parsed))
 	}
@@ -1475,47 +1263,9 @@ func TestRevisionStringPanicsOnExtremeXids(t *testing.T) {
 			"TestZedTokenAlreadyCarriesEnoughToComputeTheKey can be removed")
 
 	// The sort key itself has no such limit: it is pure uint64 arithmetic.
-	require.NotPanics(t, func() { _ = snapshotSortKey(snap(1<<63, 1<<63)) })
+	require.NotPanics(t, func() { _ = compactSortKey(snap(1<<63, 1<<63)) })
 	require.NotPanics(t, func() {
-		_ = snapshotSortKey(snap(math.MaxUint64-2, math.MaxUint64, math.MaxUint64-2))
-	})
-}
-
-// ---------------------------------------------------------------------------
-// Fuzzing
-// ---------------------------------------------------------------------------
-
-// FuzzSortKeyIsALinearExtension is the same three properties, driven by the fuzzer rather than a
-// fixed corpus, so that `go test -fuzz` can keep attacking the candidate after this lands.
-func FuzzSortKeyIsALinearExtension(f *testing.F) {
-	f.Add(uint64(4), uint64(0b0100), uint64(4), uint64(0b1100))
-	f.Add(uint64(0), uint64(0), uint64(1), uint64(0))
-	f.Add(uint64(5), uint64(0b11111), uint64(5), uint64(0))
-	f.Add(uint64(12), uint64(0b101010101010), uint64(12), uint64(0b010101010101))
-	f.Add(uint64(40), uint64(1)<<39, uint64(40), uint64(0))
-
-	f.Fuzz(func(t *testing.T, xmaxA, maskA, xmaxB, maskB uint64) {
-		// Keep the universe inside a uint64 bitmask so the snapshots stay buildable.
-		xmaxA %= bruteForceUniverse + 1
-		xmaxB %= bruteForceUniverse + 1
-
-		a := snapshotFromMask(xmaxA, maskA)
-		b := snapshotFromMask(xmaxB, maskB)
-
-		require.True(t, wellFormed(a))
-		require.True(t, wellFormed(b))
-
-		cmp := bytes.Compare(snapshotSortKey(a), snapshotSortKey(b))
-		switch a.compare(b) {
-		case lt:
-			require.Negative(t, cmp, "LessThan but key not less: %s, %s", a, b)
-		case gt:
-			require.Positive(t, cmp, "GreaterThan but key not greater: %s, %s", a, b)
-		case equal:
-			require.Zero(t, cmp, "Equal but keys differ: %s, %s", a, b)
-		case concurrent:
-			require.NotZero(t, cmp, "concurrent but keys collide: %s, %s", a, b)
-		}
+		_ = compactSortKey(snap(math.MaxUint64-2, math.MaxUint64, math.MaxUint64-2))
 	})
 }
 
