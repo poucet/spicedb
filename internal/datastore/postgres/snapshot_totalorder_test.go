@@ -161,8 +161,13 @@ const compactDigestLength = 16
 // what the digest rests on: two canonical forms that encode to the same bytes would be
 // indistinguishable no matter how good the hash is.
 //
-// The count field is what provides it. Without a length, the xip list could run into whatever
-// followed it; with one, the encoding parses back uniquely.
+// Injectivity does NOT come from the count field, which is redundant here - established by
+// mutation testing, after an earlier version of this comment claimed it did. The encoding is a
+// complete message rather than a prefix of a longer key, so two canonical forms differing only
+// in how many entries they have already produce byte strings of different lengths, and SHA-256
+// distinguishes those. The count is kept as cheap self-description for a durable format, not
+// because anything depends on it. Removing it changes every key, which is why
+// TestCompactKeyGoldenVectors is the test that notices.
 func canonicalEncoding(c pgSnapshot) []byte {
 	buf := make([]byte, 0, 16+8*len(c.xipList))
 	buf = binary.BigEndian.AppendUint64(buf, c.xmax)
@@ -1311,10 +1316,10 @@ func TestCompactSortedOrderNeverContradictsThePartialOrder(t *testing.T) {
 // xid8 is a 64-bit FullTransactionId that does not wrap, which is the whole reason SpiceDB uses
 // it rather than the wrapping 32-bit xid.
 func TestCardinalityCannotOverflow(t *testing.T) {
-	max := pgSnapshot{xmin: math.MaxUint64, xmax: math.MaxUint64}
-	require.EqualValues(t, uint64(math.MaxUint64), visibleCardinality(max))
+	topOfRange := pgSnapshot{xmin: math.MaxUint64, xmax: math.MaxUint64}
+	require.Equal(t, uint64(math.MaxUint64), visibleCardinality(topOfRange))
 	require.Equal(t, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-		compactSortKey(max)[:8], "the cardinality field saturates rather than wrapping")
+		compactSortKey(topOfRange)[:8], "the cardinality field saturates rather than wrapping")
 
 	// One hidden transaction at the very top is one below the maximum, not a wrap to zero.
 	nearMax := pgSnapshot{
@@ -1322,9 +1327,9 @@ func TestCardinalityCannotOverflow(t *testing.T) {
 		xmax:    math.MaxUint64,
 		xipList: []uint64{math.MaxUint64 - 1},
 	}
-	require.EqualValues(t, uint64(math.MaxUint64)-1, visibleCardinality(nearMax))
-	require.True(t, nearMax.LessThan(max))
-	require.Negative(t, bytes.Compare(compactSortKey(nearMax), compactSortKey(max)))
+	require.Equal(t, uint64(math.MaxUint64)-1, visibleCardinality(nearMax))
+	require.True(t, nearMax.LessThan(topOfRange))
+	require.Negative(t, bytes.Compare(compactSortKey(nearMax), compactSortKey(topOfRange)))
 
 	// And the empty snapshot sits at the bottom without underflowing.
 	require.EqualValues(t, 0, visibleCardinality(snap(0, 0)))
@@ -1347,8 +1352,10 @@ func TestCompactKeyGoldenVectors(t *testing.T) {
 		{snap(123, 456, 124, 126, 168), "00000000000001c5eff36a835d00f1e06797bdf06bdcdcf7"},
 		{snap(10, 20, 12, 15, 18), "0000000000000011598b48f943f01f513debcc8c1ecfff33"},
 		// Top of the xid range: the cardinality field saturates at all-ones, it does not wrap.
-		{pgSnapshot{xmin: math.MaxUint64, xmax: math.MaxUint64},
-			"ffffffffffffffff60c69a3e87bf5c4f1e546bec45f26269"},
+		{
+			pgSnapshot{xmin: math.MaxUint64, xmax: math.MaxUint64},
+			"ffffffffffffffff60c69a3e87bf5c4f1e546bec45f26269",
+		},
 	}
 
 	for _, v := range vectors {
