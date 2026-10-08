@@ -107,10 +107,61 @@ func newFromRevision(revision datastore.Revision, datastoreUniqueID string, sche
 		return nil, fmt.Errorf(errEncodeError, err)
 	}
 
+	// Stamp the visible set while the revision is still in hand. Encode cannot do this: the
+	// decoded form carries the revision only as a string, and a string cannot be asked which
+	// writes were visible.
+	encoded.Visibility = visibilityFor(revision)
+
 	return encoded, nil
 }
 
+// visibilityFor returns the description of which writes are visible at revision, to be carried on
+// the token as ZedToken.visibility, or nil when the revision's type has no need of it.
+//
+// Only a PARTIALLY ordered revision type sets this, and only PostgreSQL is one today. For a
+// totally ordered type every pair of revisions already has a definite order, so the causal
+// question is answerable without it and shipping a visible set would be redundant bytes on every
+// response. Absence is therefore meaningful rather than merely empty.
+//
+// ⚠️ This is the only unbounded field on a token. It carries one exception per write transaction
+// in flight when the revision was taken. TestVisibilitySizeScalesWithWritesInFlight measures it.
+//
+// A revision type that declines the capability is NOT an error. The interface is an optional
+// extension, and a token with no visible set is still a perfectly good token for reading at,
+// watching from and every other purpose a zedtoken serves. Returning an error here would turn an
+// optional capability into a hard dependency and fail Writes on every datastore that lacks it,
+// which is far worse than a token whose causality cannot be decided offline.
+// TestVisibilityUnsupportedRevisionIsNotAnError pins that. datastore.NoRevision reaches this
+// path too, and its nilRevision sentinel declines the interface, so tokens minted from it carry
+// no visible set by the same rule.
+func visibilityFor(revision datastore.Revision) *v1.RevisionVisibility {
+	vr, ok := revision.(datastore.VisibilityRevision)
+	if !ok {
+		return nil
+	}
+
+	visible := vr.VisibleSet()
+
+	// Offsets from the floor, so the varints stay small: an in-flight transaction is near the top
+	// of the range, and its absolute sequence can be a 64-bit number while its offset is tiny.
+	offsets := make([]uint64, 0, len(visible.Exceptions))
+	for _, exception := range visible.Exceptions {
+		offsets = append(offsets, exception-visible.Floor)
+	}
+
+	return &v1.RevisionVisibility{
+		Floor:            visible.Floor,
+		Ceiling:          visible.Ceiling,
+		ExceptionOffsets: offsets,
+	}
+}
+
 // Encode converts a decoded zedtoken to its opaque version.
+//
+// The returned token carries no visible set. The decoded form holds the revision only as a
+// string, which cannot be asked which writes were visible, so a token built this way cannot be
+// compared causally against others. Callers that want that must go through NewFromRevision,
+// which still holds the datastore.Revision itself.
 func Encode(decoded *zedtoken.DecodedZedToken) (*v1.ZedToken, error) {
 	marshalled, err := decoded.MarshalVT()
 	if err != nil {

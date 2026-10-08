@@ -1140,6 +1140,128 @@ type SortKeyRevision interface {
 	AppendSortKey(dst []byte) []byte
 }
 
+// VisibilityRevision is an optional extension to the Revision interface for revision types whose
+// order is PARTIAL, letting a caller ask the causal question that Equal, LessThan and GreaterThan
+// can only answer by omission.
+//
+// A revision names the set of writes that are visible at it. For a totally ordered revision type
+// that set only ever grows, so "a is after b" and "a is greater than b" are the same question.
+// For a partially ordered type they are not: two revisions can each see a write the other cannot,
+// in which case all three of Equal, LessThan and GreaterThan are false and the pair is CONCURRENT.
+// Reading that triple-false as "not less than, therefore at or after" is the bug this interface
+// exists to prevent.
+//
+//	// Four-valued, because three of the four answers are not "yes".
+//	if vr, ok := rev.(datastore.VisibilityRevision); ok {
+//		ahead := vr.Dominates(other)       // everything visible at other is visible at rev
+//		behind := otherVR.Dominates(rev)
+//		// ahead && behind  -> same visible set
+//		// ahead && !behind -> rev is strictly after other
+//		// !ahead && behind -> rev is strictly before other
+//		// neither          -> concurrent, neither is after the other
+//	}
+//
+// A revision type that DECLINES this interface is asserting that it is totally ordered, and so
+// that dominance is exactly !LessThan. Every revision type SpiceDB ships except Postgres declines
+// it on that basis. Do not implement it to mean anything else.
+//
+// This is deliberately separate from SortKeyRevision, and the two are not alternatives. A sort key
+// is a key for an ordered store; dominance is a causal question. A type may honestly offer either,
+// both or neither.
+type VisibilityRevision interface {
+	Revision
+
+	// Dominates reports whether every write visible at other is also visible at the receiver,
+	// i.e. whether visible(other) is a subset of visible(receiver). Equal revisions dominate each
+	// other; a revision always dominates itself.
+	//
+	// This is the exact question behind "has the system caught up to that revision yet". Unlike
+	// ordering it has a yes-or-no answer for every pair, concurrent pairs included: two concurrent
+	// revisions do NOT dominate each other, in either direction, because each is missing a write
+	// the other has.
+	//
+	// ⚠️ Dominance is NOT the negation of LessThan. For a concurrent pair LessThan is false and
+	// Dominates is also false. Code that reaches for !LessThan as a cheap "at or after" test is
+	// wrong on exactly the pairs this interface was added for, and wrong silently.
+	//
+	// Returns false if other is of a different concrete type, matching what Equal, LessThan and
+	// GreaterThan do with a foreign revision. Revisions are comparable only within one datastore.
+	Dominates(other Revision) bool
+
+	// VisibleSet projects this revision's visible set into a transportable form, so that a client
+	// that cannot run Dominates - one in another language, holding only a token - can reach the
+	// same answer for itself.
+	//
+	// Two revisions that are Equal MUST produce identical VisibleSets, including when their
+	// internal representations differ, or a remote caller will disagree with a local one about
+	// equality.
+	VisibleSet() VisibleSet
+}
+
+// VisibleSet is the set of writes visible at a revision, described as a contiguous range with
+// holes punched in it. It is the transportable form of what VisibilityRevision.Dominates compares,
+// so that a client holding only a token can decide causality without asking the server.
+//
+// A write is identified by an opaque unsigned sequence number. Those numbers mean nothing outside
+// one datastore, and nothing at all beyond being compared with another VisibleSet from it.
+type VisibleSet struct {
+	// Floor is the sequence below which every write is visible, with no exceptions.
+	Floor uint64
+
+	// Ceiling is the sequence at or above which no write is visible.
+	Ceiling uint64
+
+	// Exceptions are the sequences in [Floor, Ceiling) that are NOT visible, ascending and
+	// distinct. These are the writes that were still in flight when the revision was taken.
+	//
+	// This is the only unbounded part of the structure, holding one entry per in-flight write
+	// transaction, which is normally a handful.
+	Exceptions []uint64
+}
+
+// Contains reports whether the given write is visible at this revision.
+func (vs VisibleSet) Contains(sequence uint64) bool {
+	switch {
+	case sequence < vs.Floor:
+		return true
+	case sequence >= vs.Ceiling:
+		return false
+	default:
+		_, inFlight := slices.BinarySearch(vs.Exceptions, sequence)
+		return !inFlight
+	}
+}
+
+// Dominates reports whether every write visible in other is also visible here, which is the same
+// question VisibilityRevision.Dominates answers and must give the same result.
+//
+// It is written against the transported form alone, so it is the specification a client in another
+// language reimplements. There are exactly two ways other can see a write this set does not:
+//
+//  1. A write still in flight here that other has already settled.
+//  2. A write beyond this set's ceiling that other has settled.
+//
+// Checking both is sufficient because every other sequence is either below both floors, and so
+// visible to both, or at or above other's ceiling, and so visible to neither.
+func (vs VisibleSet) Dominates(other VisibleSet) bool {
+	for _, inFlight := range vs.Exceptions {
+		if other.Contains(inFlight) {
+			return false
+		}
+	}
+
+	if other.Ceiling > vs.Ceiling {
+		unseen := other.Ceiling - vs.Ceiling
+		lo, _ := slices.BinarySearch(other.Exceptions, vs.Ceiling)
+		hi, _ := slices.BinarySearch(other.Exceptions, other.Ceiling)
+		if uint64(hi-lo) < unseen { //nolint:gosec // hi >= lo, both are indices into a slice.
+			return false
+		}
+	}
+
+	return true
+}
+
 type nilRevision struct{}
 
 func (nilRevision) ByteSortable() bool {
