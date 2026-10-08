@@ -1221,6 +1221,79 @@ type VisibilityRevision interface {
 	// Returns false if other is of a different concrete type, matching what Equal, LessThan and
 	// GreaterThan do with a foreign revision. Revisions are comparable only within one datastore.
 	Dominates(other Revision) bool
+
+	// VisibleSet projects this revision's visible set into a transportable form, so that a client
+	// that cannot run Dominates - one in another language, holding only a token - can reach the
+	// same answer for itself.
+	//
+	// Two revisions that are Equal MUST produce identical VisibleSets, including when their
+	// internal representations differ, or a remote caller will disagree with a local one about
+	// equality.
+	VisibleSet() VisibleSet
+}
+
+// VisibleSet is the set of writes visible at a revision, described as a contiguous range with
+// holes punched in it. It is the transportable form of what VisibilityRevision.Dominates compares,
+// so that a client holding only a token can decide causality without asking the server.
+//
+// A write is identified by an opaque unsigned sequence number. Those numbers mean nothing outside
+// one datastore, and nothing at all beyond being compared with another VisibleSet from it.
+type VisibleSet struct {
+	// Floor is the sequence below which every write is visible, with no exceptions.
+	Floor uint64
+
+	// Ceiling is the sequence at or above which no write is visible.
+	Ceiling uint64
+
+	// Exceptions are the sequences in [Floor, Ceiling) that are NOT visible, ascending and
+	// distinct. These are the writes that were still in flight when the revision was taken.
+	//
+	// This is the only unbounded part of the structure, holding one entry per in-flight write
+	// transaction, which is normally a handful.
+	Exceptions []uint64
+}
+
+// Contains reports whether the given write is visible at this revision.
+func (vs VisibleSet) Contains(sequence uint64) bool {
+	switch {
+	case sequence < vs.Floor:
+		return true
+	case sequence >= vs.Ceiling:
+		return false
+	default:
+		_, inFlight := slices.BinarySearch(vs.Exceptions, sequence)
+		return !inFlight
+	}
+}
+
+// Dominates reports whether every write visible in other is also visible here, which is the same
+// question VisibilityRevision.Dominates answers and must give the same result.
+//
+// It is written against the transported form alone, so it is the specification a client in another
+// language reimplements. There are exactly two ways other can see a write this set does not:
+//
+//  1. A write still in flight here that other has already settled.
+//  2. A write beyond this set's ceiling that other has settled.
+//
+// Checking both is sufficient because every other sequence is either below both floors, and so
+// visible to both, or at or above other's ceiling, and so visible to neither.
+func (vs VisibleSet) Dominates(other VisibleSet) bool {
+	for _, inFlight := range vs.Exceptions {
+		if other.Contains(inFlight) {
+			return false
+		}
+	}
+
+	if other.Ceiling > vs.Ceiling {
+		unseen := other.Ceiling - vs.Ceiling
+		lo, _ := slices.BinarySearch(other.Exceptions, vs.Ceiling)
+		hi, _ := slices.BinarySearch(other.Exceptions, other.Ceiling)
+		if uint64(hi-lo) < unseen { //nolint:gosec // hi >= lo, both are indices into a slice.
+			return false
+		}
+	}
+
+	return true
 }
 
 type nilRevision struct{}
