@@ -2,7 +2,6 @@ package zedtoken
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -426,7 +425,7 @@ func TestCausalityErrorsAreUnwrappable(t *testing.T) {
 
 	_, err := CompareCausality(foreignToken, foreignToken, local)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrForeignToken), "ErrForeignToken must survive wrapping")
+	require.ErrorIs(t, err, ErrForeignToken, "ErrForeignToken must survive wrapping")
 }
 
 // TestCausalityIgnoresSchemaHash pins that two tokens naming one revision compare EQUAL even when
@@ -476,7 +475,7 @@ func TestWatermarkOverAStream(t *testing.T) {
 		newSetRevision(1, 2, 3, 4), // later still
 	}
 
-	var stoppedAt int = -1
+	stoppedAt := -1
 	for i, rev := range stream {
 		caughtUp, err := Reached(mustToken(t, rev, holder), mustToken(t, target, holder), holder)
 		require.NoError(t, err)

@@ -299,7 +299,7 @@ func TestVisibleSetSizeIsOnePerInFlightWrite(t *testing.T) {
 			// collapse the run and the worst case is really measured.
 			xips = append(xips, uint64(1+2*i))
 		}
-		s := pgSnapshot{xmin: 0, xmax: uint64(2*inFlight + 2), xipList: xips}
+		s := pgSnapshot{xmin: 0, xmax: uint64(2*inFlight + 2), xipList: xips} //nolint:gosec // inFlight is a small positive literal from the loop above.
 
 		projection := revFor(s).VisibleSet()
 		require.Len(t, projection.Exceptions, inFlight,
