@@ -358,13 +358,32 @@ type postgresRevision struct {
 }
 
 func (pr postgresRevision) ByteSortable() bool {
-	return false
+	return true
 }
 
-// NOTE: postgresRevision deliberately does not implement datastore.SortKeyRevision. These revisions
-// are transaction snapshots, and two of them can be mutually uncomparable, so there is no order for
-// bytes to preserve. Not having the method is how that is reported; see
-// TestPostgresRevisionHasNoSortKey.
+// NOTE: postgresRevision DOES implement datastore.SortKeyRevision, in sortkey.go. It did not
+// always, and the reasoning that said it could not was subtly wrong, so it is worth recording
+// what changed.
+//
+// The old reasoning: these revisions are transaction snapshots, two of them can be mutually
+// uncomparable, therefore there is no order for bytes to preserve. The first two clauses are
+// still true. The conclusion does not follow. A sort key does not have to reproduce the partial
+// order - it has to be a LINEAR EXTENSION of it, a total order that never CONTRADICTS the partial
+// one, and a partial order always admits one.
+//
+// Concretely: pgSnapshot.compare is exactly subset comparison of the transactions each snapshot
+// can see, so LessThan means strictly fewer settled transactions, so the cardinality of that set
+// already orders every comparable pair on its own. Incomparable pairs are then separated by a
+// digest of the snapshot's canonical form, which orders them deterministically but arbitrarily.
+// Nothing a caller could correctly conclude from the partial order is lost, and nothing the
+// partial order denies is asserted.
+//
+// Two consequences that are NOT obvious from the interface alone:
+//
+//   - Sorted order does not imply monotonically increasing visibility. Of two concurrent
+//     revisions, each can see a write the other cannot, and the key picks a side anyway.
+//   - The key is not injective. Two concurrent revisions can collide, so it must never be used
+//     for identity or deduplication. See the warning on AppendSortKey.
 
 func (pr postgresRevision) Equal(rhsRaw datastore.Revision) bool {
 	rhs, ok := rhsRaw.(postgresRevision)
@@ -454,7 +473,10 @@ func (pr postgresRevision) MarshalBinary() ([]byte, error) {
 	return protoRevision.MarshalVT()
 }
 
-var _ datastore.Revision = postgresRevision{}
+var (
+	_ datastore.Revision        = postgresRevision{}
+	_ datastore.SortKeyRevision = postgresRevision{}
+)
 
 func revisionKeyFunc(rev postgresRevision) uint64 {
 	return rev.optionalTxID.Uint64

@@ -1082,10 +1082,15 @@ type Revision interface {
 	// LessThan returns whether the receiver is probably less than the right hand side.
 	LessThan(Revision) bool
 
-	// ByteSortable reports whether this kind of revision is totally ordered, and so could be
-	// written as bytes that sort in revision order. It is a property of the type: every revision
-	// of a given type answers the same way. Postgres revisions are transaction snapshots and are
-	// only partially ordered, so they report false - they have no order for bytes to preserve.
+	// ByteSortable reports whether this kind of revision can be written as bytes that sort in
+	// revision order. It is a property of the type: every revision of a given type answers the
+	// same way.
+	//
+	// It does NOT report that the revision type is totally ordered, though it once did and once
+	// said so here. A partially ordered type can still be written as sorting bytes, by choosing a
+	// total order that never contradicts the partial one; Postgres revisions are transaction
+	// snapshots, are only partially ordered, and report true on exactly that basis. Read the
+	// guarantees on SortKeyRevision.AppendSortKey before relying on what the bytes mean.
 	//
 	// It says nothing about String(). For every revision type SpiceDB ships, String() is a
 	// decimal that does not sort: "9" sorts above "10".
@@ -1109,8 +1114,15 @@ type Revision interface {
 // Here the answer is the encoding itself, so a type cannot claim the capability without also
 // supplying the means to use it, and the claim cannot drift away from what the type actually does.
 //
-// Partially ordered revisions must not implement this interface, for the same reason they report
-// false from ByteSortable: they have no order for bytes to preserve.
+// PARTIALLY ORDERED REVISIONS MAY IMPLEMENT THIS INTERFACE. An earlier version of this comment
+// said they must not, on the grounds that they have no order for bytes to preserve. That was
+// wrong. A sort key does not have to reproduce the revision order, it has to never contradict
+// it, and every partial order admits such a total order - a linear extension. Postgres revisions
+// are transaction snapshots, two of which can be mutually uncomparable, and they implement this
+// interface on exactly that basis.
+//
+// The cost is borne by AppendSortKey's guarantees, which are therefore weaker than they look:
+// read them, and in particular read the warning against using a key for identity.
 type SortKeyRevision interface {
 	Revision
 
@@ -1119,13 +1131,27 @@ type SortKeyRevision interface {
 	//
 	// For any two revisions a and b from the same datastore, the keys guarantee:
 	//
-	//   - They sort in revision order. bytes.Compare of a's key and b's key is negative when
-	//     a.LessThan(b), zero when a.Equal(b), positive when a.GreaterThan(b).
+	//   - They never contradict revision order. bytes.Compare of a's key and b's key is negative
+	//     when a.LessThan(b), positive when a.GreaterThan(b), and zero when a.Equal(b) - even
+	//     when Equal revisions are internally represented differently.
+	//   - Where a and b are INCOMPARABLE - neither LessThan, GreaterThan nor Equal, which a
+	//     partially ordered revision type permits - the keys still order them, deterministically
+	//     and identically on every machine and every SpiceDB version. That order is arbitrary and
+	//     carries no causal meaning. A caller may rely on it being stable; it may not conclude
+	//     anything about which revision came first, or that the later key sees everything the
+	//     earlier one saw.
 	//   - Neither key is a prefix of the other, so appending more bytes to each cannot reorder
 	//     them. A sort key can therefore be one field of a longer key.
 	//
-	// String() gives neither: "9" sorts above "10", and "100" is a prefix of "1000", so a longer
-	// key built from "100" can outsort one built from "1000".
+	// String() gives none of these: "9" sorts above "10", and "100" is a prefix of "1000", so a
+	// longer key built from "100" can outsort one built from "1000".
+	//
+	// ⚠️ A KEY IS NOT AN IDENTITY. Equal revisions always produce equal keys, but equal keys do
+	// NOT imply equal revisions: an implementation for a partially ordered type may compress its
+	// state into a fixed-width key, and two incomparable revisions can then collide. Ordering
+	// degrades harmlessly when that happens, because the two had no order to get wrong, but code
+	// that treats equal keys as the same revision will silently merge two different ones. Never
+	// use a sort key for deduplication, cache identity, or equality.
 	//
 	// Keys are comparable only between revisions of the same type from the same datastore - the
 	// same scope in which Equal, LessThan and GreaterThan mean anything.
@@ -1133,11 +1159,141 @@ type SortKeyRevision interface {
 	// The bytes are stable across SpiceDB versions, so keys may be stored durably. An
 	// implementation must never change its encoding once released.
 	//
-	// AppendSortKey allocates only to grow dst. Implementations keep no state, so calls may be
-	// made concurrently, but dst belongs to the caller: concurrent calls must not share a dst
-	// backing array, and - as with the builtin append - a later call that reuses an earlier
-	// call's buffer may overwrite the earlier key.
+	// AppendSortKey writes its result into dst, growing it like the builtin append rather than
+	// returning a fresh slice. It may allocate internal scratch while computing the key - the
+	// Postgres implementation hashes, and is not allocation-free - so it is cheap but not free,
+	// and callers on a hot path should key once and reuse rather than recompute. Implementations
+	// keep no state, so calls may be made concurrently, but dst belongs to the caller:
+	// concurrent calls must not share a dst backing array, and - as with the builtin append - a
+	// later call that reuses an earlier call's buffer may overwrite the earlier key.
 	AppendSortKey(dst []byte) []byte
+}
+
+// VisibilityRevision is an optional extension to the Revision interface for revision types whose
+// order is PARTIAL, letting a caller ask the causal question that Equal, LessThan and GreaterThan
+// can only answer by omission.
+//
+// A revision names a set of writes that are visible at it. For a totally ordered revision type
+// that set only ever grows, so "a is after b" and "a is greater than b" are the same question.
+// For a partially ordered type they are not: two revisions can each see a write the other cannot,
+// in which case all three of Equal, LessThan and GreaterThan are false and the pair is CONCURRENT.
+// Reading that triple-false as "not less than, therefore at or after" is the bug this interface
+// exists to prevent.
+//
+//	// Four-valued, because three of the four answers are not "yes".
+//	if vr, ok := rev.(datastore.VisibilityRevision); ok {
+//		ahead := vr.Dominates(other)       // everything visible at other is visible at rev
+//		behind := otherVR.Dominates(rev)
+//		// ahead && behind  -> same visible set
+//		// ahead && !behind -> rev is strictly after other
+//		// !ahead && behind -> rev is strictly before other
+//		// neither          -> concurrent, neither is after the other
+//	}
+//
+// A revision type that DECLINES this interface is asserting that it is totally ordered, and so
+// that dominance is exactly !LessThan. Every revision type SpiceDB ships except Postgres declines
+// it on that basis. Do not implement it to mean anything else.
+//
+// This is deliberately not folded into SortKeyRevision. A sort key answers "which comes first in a
+// stable arbitrary order" and is allowed to invent an answer for an incomparable pair; dominance
+// answers "did this one see everything that one saw" and is never allowed to invent one. The two
+// disagree on exactly the pairs that matter, and a type can honestly offer either, both or neither.
+type VisibilityRevision interface {
+	Revision
+
+	// Dominates reports whether every write visible at other is also visible at the receiver,
+	// i.e. whether visible(other) is a subset of visible(receiver). Equal revisions dominate each
+	// other; a revision always dominates itself.
+	//
+	// This is the exact question behind "has the system caught up to that revision yet". Unlike
+	// ordering it has a yes-or-no answer for every pair, concurrent pairs included: two concurrent
+	// revisions do NOT dominate each other, in either direction, because each is missing a write
+	// the other has.
+	//
+	// ⚠️ Dominance is NOT the negation of LessThan. For a concurrent pair LessThan is false and
+	// Dominates is also false. Code that reaches for !LessThan as a cheap "at or after" test is
+	// wrong on exactly the pairs this interface was added for, and wrong silently.
+	//
+	// ⚠️ Dominance is NOT sort-key order either. A sort key orders a concurrent pair anyway, so
+	// it can report a revision as later than one it does not dominate. Never substitute one for
+	// the other.
+	//
+	// Returns false if other is of a different concrete type, matching what Equal, LessThan and
+	// GreaterThan do with a foreign revision. Revisions are comparable only within one datastore.
+	Dominates(other Revision) bool
+
+	// VisibleSet projects this revision's visible set into a transportable form, so that a client
+	// that cannot run Dominates - one in another language, holding only a token - can reach the
+	// same answer for itself.
+	//
+	// Two revisions that are Equal MUST produce identical VisibleSets, including when their
+	// internal representations differ, or a remote caller will disagree with a local one about
+	// equality.
+	VisibleSet() VisibleSet
+}
+
+// VisibleSet is the set of writes visible at a revision, described as a contiguous range with
+// holes punched in it. It is the transportable form of what VisibilityRevision.Dominates compares,
+// so that a client holding only a token can decide causality without asking the server.
+//
+// A write is identified by an opaque unsigned sequence number. Those numbers mean nothing outside
+// one datastore, and nothing at all beyond being compared with another VisibleSet from it.
+type VisibleSet struct {
+	// Floor is the sequence below which every write is visible, with no exceptions.
+	Floor uint64
+
+	// Ceiling is the sequence at or above which no write is visible.
+	Ceiling uint64
+
+	// Exceptions are the sequences in [Floor, Ceiling) that are NOT visible, ascending and
+	// distinct. These are the writes that were still in flight when the revision was taken.
+	//
+	// This is the only unbounded part of the structure, holding one entry per in-flight write
+	// transaction, which is normally a handful.
+	Exceptions []uint64
+}
+
+// Contains reports whether the given write is visible at this revision.
+func (vs VisibleSet) Contains(sequence uint64) bool {
+	switch {
+	case sequence < vs.Floor:
+		return true
+	case sequence >= vs.Ceiling:
+		return false
+	default:
+		_, inFlight := slices.BinarySearch(vs.Exceptions, sequence)
+		return !inFlight
+	}
+}
+
+// Dominates reports whether every write visible in other is also visible here, which is the same
+// question VisibilityRevision.Dominates answers and must give the same result.
+//
+// It is written against the transported form alone, so it is the specification a client in another
+// language reimplements. There are exactly two ways other can see a write this set does not:
+//
+//  1. A write still in flight here that other has already settled.
+//  2. A write beyond this set's ceiling that other has settled.
+//
+// Checking both is sufficient because every other sequence is either below both floors, and so
+// visible to both, or at or above other's ceiling, and so visible to neither.
+func (vs VisibleSet) Dominates(other VisibleSet) bool {
+	for _, inFlight := range vs.Exceptions {
+		if other.Contains(inFlight) {
+			return false
+		}
+	}
+
+	if other.Ceiling > vs.Ceiling {
+		unseen := other.Ceiling - vs.Ceiling
+		lo, _ := slices.BinarySearch(other.Exceptions, vs.Ceiling)
+		hi, _ := slices.BinarySearch(other.Exceptions, other.Ceiling)
+		if uint64(hi-lo) < unseen { //nolint:gosec // hi >= lo, both are indices into a slice.
+			return false
+		}
+	}
+
+	return true
 }
 
 type nilRevision struct{}

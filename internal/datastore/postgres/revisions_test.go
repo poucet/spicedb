@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"fmt"
+	"slices"
 	"strconv"
 	"testing"
 	"time"
@@ -251,15 +252,33 @@ func TestRevisionForVersionOverclaimsUnderConcurrency(t *testing.T) {
 	require.Equal(t, equal, createdRev.snapshot.compare(quiescentReadAt))
 }
 
-// TestPostgresRevisionHasNoSortKey asserts that postgresRevision declines the
-// datastore.SortKeyRevision capability, since snapshots are only partially ordered and so have no
-// order for bytes to preserve.
-func TestPostgresRevisionHasNoSortKey(t *testing.T) {
+// TestPostgresRevisionHasASortKey asserts that postgresRevision claims the
+// datastore.SortKeyRevision capability and produces a fixed-width key.
+//
+// This test previously existed as TestPostgresRevisionHasNoSortKey and asserted the exact
+// opposite, on the reasoning that a partially ordered revision type has no order for bytes to
+// preserve. It was inverted rather than deleted, because the change it guards is a contract
+// change and the old assertion is the clearest possible record of what the contract used to be.
+//
+// What changed is the reasoning, not the facts: snapshots are still only partially ordered, but
+// a sort key only has to avoid CONTRADICTING the order, and such a key exists. See the NOTE in
+// revisions.go and the properties verified in snapshot_totalorder_test.go.
+func TestPostgresRevisionHasASortKey(t *testing.T) {
 	var rev datastore.Revision = postgresRevision{snapshot: pgSnapshot{xmin: 100, xmax: 100}}
 
-	_, ok := rev.(datastore.SortKeyRevision)
-	require.False(t, ok, "postgresRevision must not implement datastore.SortKeyRevision")
+	skr, ok := rev.(datastore.SortKeyRevision)
+	require.True(t, ok, "postgresRevision must implement datastore.SortKeyRevision")
 
-	// ByteSortable reports the same property in its weaker form, and must agree.
-	require.False(t, rev.ByteSortable())
+	key := skr.AppendSortKey(nil)
+	require.Len(t, key, sortKeyLength)
+
+	// ByteSortable reports the same capability in its weaker form, and must agree.
+	require.True(t, rev.ByteSortable())
+
+	// The append contract: a non-nil dst is preserved and extended, never replaced.
+	prefix := []byte("existing")
+	extended := skr.AppendSortKey(slices.Clone(prefix))
+	require.Len(t, extended, len(prefix)+sortKeyLength)
+	require.Equal(t, prefix, extended[:len(prefix)])
+	require.Equal(t, key, extended[len(prefix):])
 }
