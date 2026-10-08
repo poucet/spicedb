@@ -1169,6 +1169,60 @@ type SortKeyRevision interface {
 	AppendSortKey(dst []byte) []byte
 }
 
+// VisibilityRevision is an optional extension to the Revision interface for revision types whose
+// order is PARTIAL, letting a caller ask the causal question that Equal, LessThan and GreaterThan
+// can only answer by omission.
+//
+// A revision names a set of writes that are visible at it. For a totally ordered revision type
+// that set only ever grows, so "a is after b" and "a is greater than b" are the same question.
+// For a partially ordered type they are not: two revisions can each see a write the other cannot,
+// in which case all three of Equal, LessThan and GreaterThan are false and the pair is CONCURRENT.
+// Reading that triple-false as "not less than, therefore at or after" is the bug this interface
+// exists to prevent.
+//
+//	// Four-valued, because three of the four answers are not "yes".
+//	if vr, ok := rev.(datastore.VisibilityRevision); ok {
+//		ahead := vr.Dominates(other)       // everything visible at other is visible at rev
+//		behind := otherVR.Dominates(rev)
+//		// ahead && behind  -> same visible set
+//		// ahead && !behind -> rev is strictly after other
+//		// !ahead && behind -> rev is strictly before other
+//		// neither          -> concurrent, neither is after the other
+//	}
+//
+// A revision type that DECLINES this interface is asserting that it is totally ordered, and so
+// that dominance is exactly !LessThan. Every revision type SpiceDB ships except Postgres declines
+// it on that basis. Do not implement it to mean anything else.
+//
+// This is deliberately not folded into SortKeyRevision. A sort key answers "which comes first in a
+// stable arbitrary order" and is allowed to invent an answer for an incomparable pair; dominance
+// answers "did this one see everything that one saw" and is never allowed to invent one. The two
+// disagree on exactly the pairs that matter, and a type can honestly offer either, both or neither.
+type VisibilityRevision interface {
+	Revision
+
+	// Dominates reports whether every write visible at other is also visible at the receiver,
+	// i.e. whether visible(other) is a subset of visible(receiver). Equal revisions dominate each
+	// other; a revision always dominates itself.
+	//
+	// This is the exact question behind "has the system caught up to that revision yet". Unlike
+	// ordering it has a yes-or-no answer for every pair, concurrent pairs included: two concurrent
+	// revisions do NOT dominate each other, in either direction, because each is missing a write
+	// the other has.
+	//
+	// ⚠️ Dominance is NOT the negation of LessThan. For a concurrent pair LessThan is false and
+	// Dominates is also false. Code that reaches for !LessThan as a cheap "at or after" test is
+	// wrong on exactly the pairs this interface was added for, and wrong silently.
+	//
+	// ⚠️ Dominance is NOT sort-key order either. A sort key orders a concurrent pair anyway, so
+	// it can report a revision as later than one it does not dominate. Never substitute one for
+	// the other.
+	//
+	// Returns false if other is of a different concrete type, matching what Equal, LessThan and
+	// GreaterThan do with a foreign revision. Revisions are comparable only within one datastore.
+	Dominates(other Revision) bool
+}
+
 type nilRevision struct{}
 
 func (nilRevision) ByteSortable() bool {
