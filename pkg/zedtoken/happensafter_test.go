@@ -359,6 +359,103 @@ func TestCausalityFallbackForTotallyOrderedRevisions(t *testing.T) {
 	require.False(t, reached)
 }
 
+// forgetfulRevision is a PARTIALLY ordered revision type that does NOT implement
+// datastore.VisibilityRevision, which is the mistake a future datastore author can make. It wraps
+// setRevision and hides the method.
+type forgetfulRevision struct{ inner setRevision }
+
+// The methods are written out rather than promoted by embedding: embedding setRevision would also
+// promote Dominates and VisibleSet, and the type would silently satisfy the very interface it is
+// supposed to decline.
+func (fr forgetfulRevision) String() string     { return fr.inner.String() }
+func (fr forgetfulRevision) ByteSortable() bool { return fr.inner.ByteSortable() }
+
+func (fr forgetfulRevision) Equal(rhs datastore.Revision) bool {
+	other, ok := rhs.(forgetfulRevision)
+	return ok && fr.inner.Equal(other.inner)
+}
+
+func (fr forgetfulRevision) LessThan(rhs datastore.Revision) bool {
+	other, ok := rhs.(forgetfulRevision)
+	return ok && fr.inner.LessThan(other.inner)
+}
+
+func (fr forgetfulRevision) GreaterThan(rhs datastore.Revision) bool {
+	other, ok := rhs.(forgetfulRevision)
+	return ok && fr.inner.GreaterThan(other.inner)
+}
+
+var _ datastore.Revision = forgetfulRevision{}
+
+type forgetfulHolder struct{ datastoreUniqueID string }
+
+func (fh forgetfulHolder) UniqueID(_ context.Context) (string, error) {
+	return fh.datastoreUniqueID, nil
+}
+
+func (fh forgetfulHolder) RevisionFromString(s string) (datastore.Revision, error) {
+	inner, err := setHolder(fh).RevisionFromString(s)
+	if err != nil {
+		return nil, err
+	}
+	return forgetfulRevision{inner: inner.(setRevision)}, nil
+}
+
+var _ RevisionHolder = forgetfulHolder{}
+
+// TestFallbackFailsSafeForAPartiallyOrderedType pins the safety property the fallback's doc
+// comment claims, which nothing else covers: a partially ordered revision type that forgets to
+// implement VisibilityRevision must UNDER-report dominance rather than over-report it.
+//
+// The fallback is written as Equal || GreaterThan, not !LessThan. The two agree for every totally
+// ordered type, so no other test can tell them apart. They differ here: for a concurrent pair
+// Equal, LessThan and GreaterThan are all false, so
+//
+//   - Equal || GreaterThan gives false both ways, which reports CONCURRENT. Honest.
+//   - !LessThan gives true both ways, which reports EQUAL. A confident wrong answer, and the
+//     watermark would say a stream had caught up when it had not.
+//
+// This test was added after a mutation to !LessThan passed the whole suite.
+func TestFallbackFailsSafeForAPartiallyOrderedType(t *testing.T) {
+	holder := forgetfulHolder{causalityTestDatastoreID}
+
+	// Guard the premise: the type must really decline the interface, or this proves nothing.
+	var rev datastore.Revision = forgetfulRevision{inner: newSetRevision(1, 3, 4)}
+	_, implementsVisibility := rev.(datastore.VisibilityRevision)
+	require.False(t, implementsVisibility, "forgetfulRevision must NOT implement VisibilityRevision")
+
+	tokenFor := func(visible ...uint64) *v1.ZedToken {
+		token, err := NewFromRevision(context.Background(), forgetfulRevision{inner: newSetRevision(visible...)},
+			datalayer.NoSchemaHashInLegacyZedToken, holder)
+		require.NoError(t, err)
+		return token
+	}
+
+	sees3, sees2 := tokenFor(1, 3, 4), tokenFor(1, 2, 4)
+
+	got, err := CompareCausality(sees3, sees2, holder)
+	require.NoError(t, err)
+	require.Equal(t, OrderingConcurrent, got,
+		"a concurrent pair must report CONCURRENT, not EQUAL; the fallback must not be !LessThan")
+
+	reached, err := Reached(sees3, sees2, holder)
+	require.NoError(t, err)
+	require.False(t, reached, "a concurrent revision has NOT reached the target")
+
+	reached, err = Reached(sees2, sees3, holder)
+	require.NoError(t, err)
+	require.False(t, reached, "nor the other way round")
+
+	// And the genuinely ordered pairs still work, so the fallback is not merely refusing everything.
+	got, err = CompareCausality(tokenFor(1, 2, 3, 4), sees3, holder)
+	require.NoError(t, err)
+	require.Equal(t, OrderingAfter, got)
+
+	got, err = CompareCausality(tokenFor(1, 3, 4), sees3, holder)
+	require.NoError(t, err)
+	require.Equal(t, OrderingEqual, got)
+}
+
 // TestCausalityRejectsForeignTokens pins that tokens from another datastore are refused rather
 // than compared. Causality is only defined within one datastore.
 func TestCausalityRejectsForeignTokens(t *testing.T) {
