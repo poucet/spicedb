@@ -1082,10 +1082,15 @@ type Revision interface {
 	// LessThan returns whether the receiver is probably less than the right hand side.
 	LessThan(Revision) bool
 
-	// ByteSortable reports whether this kind of revision is totally ordered, and so could be
-	// written as bytes that sort in revision order. It is a property of the type: every revision
-	// of a given type answers the same way. Postgres revisions are transaction snapshots and are
-	// only partially ordered, so they report false - they have no order for bytes to preserve.
+	// ByteSortable reports whether this kind of revision can be written as bytes that sort in
+	// revision order. It is a property of the type: every revision of a given type answers the
+	// same way.
+	//
+	// It does NOT report that the revision type is totally ordered, though it once did and once
+	// said so here. A partially ordered type can still be written as sorting bytes, by choosing a
+	// total order that never contradicts the partial one; Postgres revisions are transaction
+	// snapshots, are only partially ordered, and report true on exactly that basis. Read the
+	// guarantees on SortKeyRevision.AppendSortKey before relying on what the bytes mean.
 	//
 	// It says nothing about String(). For every revision type SpiceDB ships, String() is a
 	// decimal that does not sort: "9" sorts above "10".
@@ -1109,8 +1114,15 @@ type Revision interface {
 // Here the answer is the encoding itself, so a type cannot claim the capability without also
 // supplying the means to use it, and the claim cannot drift away from what the type actually does.
 //
-// Partially ordered revisions must not implement this interface, for the same reason they report
-// false from ByteSortable: they have no order for bytes to preserve.
+// PARTIALLY ORDERED REVISIONS MAY IMPLEMENT THIS INTERFACE. An earlier version of this comment
+// said they must not, on the grounds that they have no order for bytes to preserve. That was
+// wrong. A sort key does not have to reproduce the revision order, it has to never contradict
+// it, and every partial order admits such a total order - a linear extension. Postgres revisions
+// are transaction snapshots, two of which can be mutually uncomparable, and they implement this
+// interface on exactly that basis.
+//
+// The cost is borne by AppendSortKey's guarantees, which are therefore weaker than they look:
+// read them, and in particular read the warning against using a key for identity.
 type SortKeyRevision interface {
 	Revision
 
@@ -1119,13 +1131,27 @@ type SortKeyRevision interface {
 	//
 	// For any two revisions a and b from the same datastore, the keys guarantee:
 	//
-	//   - They sort in revision order. bytes.Compare of a's key and b's key is negative when
-	//     a.LessThan(b), zero when a.Equal(b), positive when a.GreaterThan(b).
+	//   - They never contradict revision order. bytes.Compare of a's key and b's key is negative
+	//     when a.LessThan(b), positive when a.GreaterThan(b), and zero when a.Equal(b) - even
+	//     when Equal revisions are internally represented differently.
+	//   - Where a and b are INCOMPARABLE - neither LessThan, GreaterThan nor Equal, which a
+	//     partially ordered revision type permits - the keys still order them, deterministically
+	//     and identically on every machine and every SpiceDB version. That order is arbitrary and
+	//     carries no causal meaning. A caller may rely on it being stable; it may not conclude
+	//     anything about which revision came first, or that the later key sees everything the
+	//     earlier one saw.
 	//   - Neither key is a prefix of the other, so appending more bytes to each cannot reorder
 	//     them. A sort key can therefore be one field of a longer key.
 	//
-	// String() gives neither: "9" sorts above "10", and "100" is a prefix of "1000", so a longer
-	// key built from "100" can outsort one built from "1000".
+	// String() gives none of these: "9" sorts above "10", and "100" is a prefix of "1000", so a
+	// longer key built from "100" can outsort one built from "1000".
+	//
+	// ⚠️ A KEY IS NOT AN IDENTITY. Equal revisions always produce equal keys, but equal keys do
+	// NOT imply equal revisions: an implementation for a partially ordered type may compress its
+	// state into a fixed-width key, and two incomparable revisions can then collide. Ordering
+	// degrades harmlessly when that happens, because the two had no order to get wrong, but code
+	// that treats equal keys as the same revision will silently merge two different ones. Never
+	// use a sort key for deduplication, cache identity, or equality.
 	//
 	// Keys are comparable only between revisions of the same type from the same datastore - the
 	// same scope in which Equal, LessThan and GreaterThan mean anything.
@@ -1133,10 +1159,13 @@ type SortKeyRevision interface {
 	// The bytes are stable across SpiceDB versions, so keys may be stored durably. An
 	// implementation must never change its encoding once released.
 	//
-	// AppendSortKey allocates only to grow dst. Implementations keep no state, so calls may be
-	// made concurrently, but dst belongs to the caller: concurrent calls must not share a dst
-	// backing array, and - as with the builtin append - a later call that reuses an earlier
-	// call's buffer may overwrite the earlier key.
+	// AppendSortKey writes its result into dst, growing it like the builtin append rather than
+	// returning a fresh slice. It may allocate internal scratch while computing the key - the
+	// Postgres implementation hashes, and is not allocation-free - so it is cheap but not free,
+	// and callers on a hot path should key once and reuse rather than recompute. Implementations
+	// keep no state, so calls may be made concurrently, but dst belongs to the caller:
+	// concurrent calls must not share a dst backing array, and - as with the builtin append - a
+	// later call that reuses an earlier call's buffer may overwrite the earlier key.
 	AppendSortKey(dst []byte) []byte
 }
 

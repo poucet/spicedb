@@ -27,6 +27,7 @@ import (
 	"math/bits"
 	"math/rand/v2"
 	"slices"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -35,83 +36,20 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// The candidate under test
+// Research scaffolding: the variable-width key, which is NOT what ships
 // ---------------------------------------------------------------------------
 
-// visibleCardinality returns how many transaction IDs the snapshot considers settled, which is
-// |{t : s.txVisible(t)}|. Every txid >= xmax is invisible, so the set is finite.
+// snapshotSortKey is the FIRST candidate, kept only as the evidence base for the shipping one.
+// It is not production code and nothing calls it outside this file. The production key is
+// postgresRevision.AppendSortKey in sortkey.go, which is fixed width; this one grows with the
+// number of in-flight transactions and reached 4020 bytes on a 500-transaction snapshot, which
+// is what ruled it out.
 //
-// Derived from txVisible (snapshot.go:332-342), not assumed:
+// It earns its keep by carrying the findings that explain the shape of the production key:
+// canonical xmax is monotone where raw xmax is not, and prefix-freedom is structural rather than
+// a property of the length field. Delete it only together with those tests.
 //
-//   - txid <  xmin            -> visible    (xmin of them)
-//   - txid >= xmax            -> invisible
-//   - otherwise               -> visible iff not in xipList
-//
-// so the count is xmax minus the number of DISTINCT xipList entries that actually fall in
-// [xmin, xmax). The qualifier matters. txVisible ignores an xipList entry below xmin - it returns
-// true before ever consulting the list - and it ignores one at or above xmax. The naive
-// xmax - len(xipList) counts both, and double-counts duplicates.
-func visibleCardinality(s pgSnapshot) uint64 {
-	sorted := slices.Clone(s.xipList)
-	slices.Sort(sorted)
-
-	var hidden uint64
-	var prev uint64
-	havePrev := false
-	for _, x := range sorted {
-		if x < s.xmin || x >= s.xmax {
-			continue // txVisible never consults the list for these
-		}
-		if havePrev && x == prev {
-			continue // a duplicate hides nothing extra
-		}
-		hidden++
-		prev = x
-		havePrev = true
-	}
-
-	return s.xmax - hidden
-}
-
-// canonicalize returns the unique representative of the equivalence class of snapshots with the
-// same visible set, so that a tiebreaker computed over the triple cannot disagree with Equal.
-//
-// This is required, not cosmetic: snap(1,1) and snap(1,5,1,2,3,4) are Equal under compare
-// (asserted by the existing TestCompare, snapshot_test.go:110) and have completely different
-// triples. Any tiebreaker over the raw (xmin, xmax, xipList) breaks the Equal requirement.
-//
-// The normal form drops the maximal suffix of in-progress transactions at the top of the range -
-// a transaction nobody has seen settle is indistinguishable from one beyond xmax - and then pins
-// xmin where markComplete does (snapshot.go:257-262).
-func canonicalize(s pgSnapshot) pgSnapshot {
-	xip := make([]uint64, 0, len(s.xipList))
-	for _, x := range s.xipList {
-		if x < s.xmin || x >= s.xmax {
-			continue
-		}
-		xip = append(xip, x)
-	}
-	slices.Sort(xip)
-	xip = slices.Compact(xip)
-
-	xmax := s.xmax
-	for len(xip) > 0 && xmax > 0 && xip[len(xip)-1] == xmax-1 {
-		xmax--
-		xip = xip[:len(xip)-1]
-	}
-
-	xmin := xmax
-	if len(xip) > 0 {
-		xmin = xip[0]
-	} else {
-		xip = nil
-	}
-
-	return pgSnapshot{xmin, xmax, xip}
-}
-
-// snapshotSortKey is THE CANDIDATE. Bytes that are claimed to sort as a linear extension of
-// compare.
+// Bytes that sort as a linear extension of compare:
 //
 //	[8 bytes BE] visible-set cardinality   - monotone, carries the order
 //	[8 bytes BE] canonical xmax            - also monotone, breaks ties
@@ -147,68 +85,24 @@ func snapshotSortKey(s pgSnapshot) []byte {
 }
 
 // ---------------------------------------------------------------------------
-// The compact, fixed-width candidate
+// The production key
 // ---------------------------------------------------------------------------
 
-// compactSortKeyLength is the full width of a compact key: 8 bytes of cardinality then 16 bytes
-// of digest. Fixed, whatever the snapshot looks like.
-const compactSortKeyLength = 24
-
-// compactDigestLength is how much of the SHA-256 digest is kept.
-const compactDigestLength = 16
-
-// canonicalEncoding is an INJECTIVE byte encoding of a snapshot's canonical form. Injectivity is
-// what the digest rests on: two canonical forms that encode to the same bytes would be
-// indistinguishable no matter how good the hash is.
-//
-// Injectivity does NOT come from the count field, which is redundant here - established by
-// mutation testing, after an earlier version of this comment claimed it did. The encoding is a
-// complete message rather than a prefix of a longer key, so two canonical forms differing only
-// in how many entries they have already produce byte strings of different lengths, and SHA-256
-// distinguishes those. The count is kept as cheap self-description for a durable format, not
-// because anything depends on it. Removing it changes every key, which is why
-// TestCompactKeyGoldenVectors is the test that notices.
-func canonicalEncoding(c pgSnapshot) []byte {
-	buf := make([]byte, 0, 16+8*len(c.xipList))
-	buf = binary.BigEndian.AppendUint64(buf, c.xmax)
-	buf = binary.BigEndian.AppendUint64(buf, spiceerrors.MustSafecast[uint64](len(c.xipList)))
-	for _, x := range c.xipList {
-		buf = binary.BigEndian.AppendUint64(buf, x)
-	}
-	return buf
-}
-
-// compactSortKey is THE SHIPPABLE CANDIDATE: 24 bytes, fixed width, whatever the snapshot.
-//
-//	[8  bytes BE] visible-set cardinality          - orders every comparable pair, on its own
-//	[16 bytes]    SHA-256(canonical encoding)[:16] - separates incomparable snapshots
-//
-// The whole design rests on one property, which TestCardinalityAloneSeparatesEveryComparablePair
-// checks exhaustively rather than assuming: LessThan is exactly strict-subset-of-visible-sets, a
-// strict subset of a finite set is strictly smaller, so an ordered pair ALWAYS differs in the
-// first eight bytes. The digest is therefore never consulted for a pair that has a real order.
-// It only ever separates snapshots that are concurrent, and those have no causal relationship
-// for it to get wrong.
-//
-// That is why truncating the canonical form to a digest is safe where dropping it entirely is
-// not. The information being discarded cannot affect any ordering that means anything.
-//
-// On the hash: SHA-256 is specified bit-for-bit, frozen, in the standard library, and identical
-// on every platform, architecture and Go version - the properties that matter when keys are
-// stored durably and the encoding can never change. maphash is disqualified outright because it
-// is seeded per process. A non-cryptographic hash would also be acceptable on the merits, but
-// the cheap ones with stdlib support avalanche poorly, which erodes the birthday bound that is
-// the entire safety argument here, and the cost is a single hash per token issue against a
-// database round trip.
+// compactSortKey is the PRODUCTION key, reached through the production entry point so that these
+// properties are asserted about the code that actually ships rather than about a copy of it.
 func compactSortKey(s pgSnapshot) []byte {
-	return compactSortKeyWithDigestLength(s, compactDigestLength)
+	return postgresRevision{snapshot: s}.AppendSortKey(nil)
 }
 
 // compactSortKeyWithDigestLength is compactSortKey with a shrinkable digest, so that collisions
 // can be forced at a tiny width and the degradation mode observed directly rather than argued
 // about. See TestTruncatedDigestOnlyEverCollidesIncomparablePairs.
+//
+// It necessarily restates the production key's layout, since the production function has no
+// width knob. TestTruncatedDigestMatchesProductionAtFullWidth pins the two together so this copy
+// cannot drift.
 func compactSortKeyWithDigestLength(s pgSnapshot, digestLength int) []byte {
-	digest := sha256.Sum256(canonicalEncoding(canonicalize(s)))
+	digest := sha256.Sum256(appendCanonicalEncoding(nil, canonicalize(s)))
 
 	key := make([]byte, 0, 8+digestLength)
 	key = binary.BigEndian.AppendUint64(key, visibleCardinality(s))
@@ -1125,7 +1019,7 @@ func TestCompactKeyIsALinearExtension(t *testing.T) {
 // The variable-width key reached 4020 bytes on the same input.
 func TestCompactKeyIsFixedWidth(t *testing.T) {
 	for _, s := range allTestSnapshots() {
-		require.Len(t, compactSortKey(s), compactSortKeyLength, "width varied for %s", s)
+		require.Len(t, compactSortKey(s), sortKeyLength, "width varied for %s", s)
 	}
 
 	inProgress := make([]uint64, 0, 500)
@@ -1137,7 +1031,7 @@ func TestCompactKeyIsFixedWidth(t *testing.T) {
 	big := makeWellFormed(1000, inProgress)
 
 	require.Len(t, big.xipList, 500)
-	require.Len(t, compactSortKey(big), compactSortKeyLength)
+	require.Len(t, compactSortKey(big), sortKeyLength)
 	t.Logf("%d in-progress transactions: variable key %d bytes, compact key %d bytes",
 		len(big.xipList), len(snapshotSortKey(big)), len(compactSortKey(big)))
 }
@@ -1170,7 +1064,7 @@ func TestCompactKeyHasNoCollisionsInTheCorpus(t *testing.T) {
 	keys := map[string]pgSnapshot{}
 
 	for _, s := range allTestSnapshots() {
-		form := string(canonicalEncoding(canonicalize(s)))
+		form := string(appendCanonicalEncoding(nil, canonicalize(s)))
 		forms[form] = s
 
 		key := string(compactSortKey(s))
@@ -1237,11 +1131,78 @@ func TestTruncatedDigestOnlyEverCollidesIncomparablePairs(t *testing.T) {
 					"a one-byte digest over %d snapshots should collide; if it does not, this "+
 						"test is not demonstrating anything", len(snapshots))
 			}
-			if digestLength == compactDigestLength {
+			if digestLength == sortKeyDigestLength {
 				require.Zero(t, collisions, "no collision expected at the shipping width")
 			}
 		})
 	}
+}
+
+// TestTruncatedDigestMatchesProductionAtFullWidth pins the test-only width-knob copy of the key
+// layout against the production function, so the collision experiment cannot quietly drift away
+// from the thing it is making claims about.
+func TestTruncatedDigestMatchesProductionAtFullWidth(t *testing.T) {
+	for _, s := range allTestSnapshots() {
+		require.Equal(t,
+			postgresRevision{snapshot: s}.AppendSortKey(nil),
+			compactSortKeyWithDigestLength(s, sortKeyDigestLength),
+			"the width-knob copy diverged from production for %s", s)
+	}
+}
+
+// TestAppendSortKeyHonoursTheAppendContract checks the production entry point against the
+// contract in pkg/datastore/datastore.go: write into dst, grow it like append, never replace it.
+func TestAppendSortKeyHonoursTheAppendContract(t *testing.T) {
+	for _, s := range allTestSnapshots() {
+		rev := postgresRevision{snapshot: s}
+
+		standalone := rev.AppendSortKey(nil)
+		require.Len(t, standalone, sortKeyLength)
+
+		prefix := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+		extended := rev.AppendSortKey(slices.Clone(prefix))
+		require.Len(t, extended, len(prefix)+sortKeyLength)
+		require.Equal(t, prefix, extended[:len(prefix)], "dst was not preserved")
+		require.Equal(t, standalone, extended[len(prefix):], "appended key differs from standalone")
+
+		// Appending twice to the same buffer yields the key twice, as the builtin append would.
+		twice := rev.AppendSortKey(rev.AppendSortKey(nil))
+		require.Len(t, twice, 2*sortKeyLength)
+		require.Equal(t, standalone, twice[:sortKeyLength])
+		require.Equal(t, standalone, twice[sortKeyLength:])
+
+		// Into a buffer with spare capacity, so the append does not reallocate.
+		roomy := make([]byte, 0, 4+sortKeyLength)
+		roomy = append(roomy, prefix...)
+		inPlace := rev.AppendSortKey(roomy)
+		require.Equal(t, extended, inPlace)
+	}
+}
+
+// TestAppendSortKeyIsConcurrencySafe exercises the "implementations keep no state" clause. The
+// -race build is what makes this meaningful.
+func TestAppendSortKeyIsConcurrencySafe(t *testing.T) {
+	snapshots := allTestSnapshots()
+	want := make([][]byte, len(snapshots))
+	for i, s := range snapshots {
+		want[i] = postgresRevision{snapshot: s}.AppendSortKey(nil)
+	}
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i, s := range snapshots {
+				// Each goroutine owns its own dst, as the contract requires.
+				if !bytes.Equal(want[i], postgresRevision{snapshot: s}.AppendSortKey(nil)) {
+					t.Errorf("concurrent key mismatch for %s", s)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // TestCompactKeyIsATotalPreorder states precisely what the compact key guarantees, which is
@@ -1361,7 +1322,7 @@ func TestCompactKeyGoldenVectors(t *testing.T) {
 	for _, v := range vectors {
 		got := hex.EncodeToString(compactSortKey(v.snapshot))
 		require.Equal(t, v.want, got, "golden vector changed for %s", v.snapshot)
-		require.Len(t, got, compactSortKeyLength*2)
+		require.Len(t, got, sortKeyLength*2)
 	}
 }
 
@@ -1579,8 +1540,8 @@ func FuzzCompactSortKeyIsALinearExtension(f *testing.F) {
 		b := snapshotFromMask(xmaxB, maskB)
 
 		keyA, keyB := compactSortKey(a), compactSortKey(b)
-		require.Len(t, keyA, compactSortKeyLength)
-		require.Len(t, keyB, compactSortKeyLength)
+		require.Len(t, keyA, sortKeyLength)
+		require.Len(t, keyB, sortKeyLength)
 
 		cmp := bytes.Compare(keyA, keyB)
 		switch a.compare(b) {
