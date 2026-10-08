@@ -19,7 +19,9 @@ package postgres
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"math"
 	"math/bits"
@@ -142,6 +144,70 @@ func snapshotSortKey(s pgSnapshot) []byte {
 	}
 
 	return key
+}
+
+// ---------------------------------------------------------------------------
+// The compact, fixed-width candidate
+// ---------------------------------------------------------------------------
+
+// compactSortKeyLength is the full width of a compact key: 8 bytes of cardinality then 16 bytes
+// of digest. Fixed, whatever the snapshot looks like.
+const compactSortKeyLength = 24
+
+// compactDigestLength is how much of the SHA-256 digest is kept.
+const compactDigestLength = 16
+
+// canonicalEncoding is an INJECTIVE byte encoding of a snapshot's canonical form. Injectivity is
+// what the digest rests on: two canonical forms that encode to the same bytes would be
+// indistinguishable no matter how good the hash is.
+//
+// The count field is what provides it. Without a length, the xip list could run into whatever
+// followed it; with one, the encoding parses back uniquely.
+func canonicalEncoding(c pgSnapshot) []byte {
+	buf := make([]byte, 0, 16+8*len(c.xipList))
+	buf = binary.BigEndian.AppendUint64(buf, c.xmax)
+	buf = binary.BigEndian.AppendUint64(buf, spiceerrors.MustSafecast[uint64](len(c.xipList)))
+	for _, x := range c.xipList {
+		buf = binary.BigEndian.AppendUint64(buf, x)
+	}
+	return buf
+}
+
+// compactSortKey is THE SHIPPABLE CANDIDATE: 24 bytes, fixed width, whatever the snapshot.
+//
+//	[8  bytes BE] visible-set cardinality          - orders every comparable pair, on its own
+//	[16 bytes]    SHA-256(canonical encoding)[:16] - separates incomparable snapshots
+//
+// The whole design rests on one property, which TestCardinalityAloneSeparatesEveryComparablePair
+// checks exhaustively rather than assuming: LessThan is exactly strict-subset-of-visible-sets, a
+// strict subset of a finite set is strictly smaller, so an ordered pair ALWAYS differs in the
+// first eight bytes. The digest is therefore never consulted for a pair that has a real order.
+// It only ever separates snapshots that are concurrent, and those have no causal relationship
+// for it to get wrong.
+//
+// That is why truncating the canonical form to a digest is safe where dropping it entirely is
+// not. The information being discarded cannot affect any ordering that means anything.
+//
+// On the hash: SHA-256 is specified bit-for-bit, frozen, in the standard library, and identical
+// on every platform, architecture and Go version - the properties that matter when keys are
+// stored durably and the encoding can never change. maphash is disqualified outright because it
+// is seeded per process. A non-cryptographic hash would also be acceptable on the merits, but
+// the cheap ones with stdlib support avalanche poorly, which erodes the birthday bound that is
+// the entire safety argument here, and the cost is a single hash per token issue against a
+// database round trip.
+func compactSortKey(s pgSnapshot) []byte {
+	return compactSortKeyWithDigestLength(s, compactDigestLength)
+}
+
+// compactSortKeyWithDigestLength is compactSortKey with a shrinkable digest, so that collisions
+// can be forced at a tiny width and the degradation mode observed directly rather than argued
+// about. See TestTruncatedDigestOnlyEverCollidesIncomparablePairs.
+func compactSortKeyWithDigestLength(s pgSnapshot, digestLength int) []byte {
+	digest := sha256.Sum256(canonicalEncoding(canonicalize(s)))
+
+	key := make([]byte, 0, 8+digestLength)
+	key = binary.BigEndian.AppendUint64(key, visibleCardinality(s))
+	return append(key, digest[:digestLength]...)
 }
 
 // ---------------------------------------------------------------------------
@@ -957,6 +1023,342 @@ func TestMarkCompleteIsMonotoneInTheSortKey(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// The compact key: 24 bytes, fixed width
+// ---------------------------------------------------------------------------
+
+// TestCardinalityAloneSeparatesEveryComparablePair is the single claim the fixed-width design
+// rests on. If one comparable pair anywhere shares a cardinality, the digest would have to carry
+// real ordering information, a 16-byte digest could not, and the design is dead.
+//
+// It follows from LessThan being exactly strict-subset-of-visible-sets
+// (TestCompareIsSubsetComparisonOfVisibleSets): a strict subset of a finite set is strictly
+// smaller. This asserts it over the corpus anyway, because a proof that rests on another test's
+// result should be checked where it is used.
+func TestCardinalityAloneSeparatesEveryComparablePair(t *testing.T) {
+	snapshots := allTestSnapshots()
+
+	cards := make([]uint64, len(snapshots))
+	for i, s := range snapshots {
+		cards[i] = visibleCardinality(s)
+	}
+
+	var ordered, equalPairs, concurrentPairs, concurrentSameCard int
+	for i, a := range snapshots {
+		for j, b := range snapshots {
+			switch a.compare(b) {
+			case lt:
+				ordered++
+				require.Less(t, cards[i], cards[j],
+					"COUNTEREXAMPLE: %s < %s but cardinality %d is not less than %d",
+					a, b, cards[i], cards[j])
+			case gt:
+				ordered++
+				require.Greater(t, cards[i], cards[j],
+					"COUNTEREXAMPLE: %s > %s but cardinality %d is not greater than %d",
+					a, b, cards[i], cards[j])
+			case equal:
+				equalPairs++
+				require.Equal(t, cards[i], cards[j],
+					"COUNTEREXAMPLE: %s == %s but cardinalities %d and %d differ",
+					a, b, cards[i], cards[j])
+			case concurrent:
+				concurrentPairs++
+				if cards[i] == cards[j] {
+					concurrentSameCard++
+				}
+			}
+		}
+	}
+
+	t.Logf("ordered=%d equal=%d concurrent=%d, of which %d share a cardinality and so are "+
+		"separated only by the digest", ordered, equalPairs, concurrentPairs, concurrentSameCard)
+
+	require.Positive(t, ordered)
+	require.Positive(t, concurrentSameCard,
+		"no concurrent pair shares a cardinality, so the digest is never exercised and this "+
+			"corpus cannot justify including it")
+}
+
+// TestCompactKeyIsALinearExtension runs the same three requirements as the variable-width key,
+// against the 24-byte one.
+func TestCompactKeyIsALinearExtension(t *testing.T) {
+	snapshots := allTestSnapshots()
+	keys := make([][]byte, len(snapshots))
+	for i, s := range snapshots {
+		keys[i] = compactSortKey(s)
+	}
+
+	var ltPairs, eqPairs, concurrentPairs int
+	for i, a := range snapshots {
+		for j, b := range snapshots {
+			cmp := bytes.Compare(keys[i], keys[j])
+			switch a.compare(b) {
+			case lt:
+				ltPairs++
+				require.Negative(t, cmp, "LessThan but key not less:\n  %s -> %x\n  %s -> %x",
+					a, keys[i], b, keys[j])
+			case gt:
+				require.Positive(t, cmp, "GreaterThan but key not greater:\n  %s -> %x\n  %s -> %x",
+					a, keys[i], b, keys[j])
+			case equal:
+				eqPairs++
+				require.Zero(t, cmp, "Equal but keys differ:\n  %s -> %x\n  %s -> %x",
+					a, keys[i], b, keys[j])
+			case concurrent:
+				concurrentPairs++
+			}
+		}
+	}
+
+	t.Logf("seed=%#x snapshots=%d pairs=%d (lt/gt=%d equal=%d concurrent=%d)",
+		randomSeed, len(snapshots), len(snapshots)*len(snapshots), ltPairs*2, eqPairs, concurrentPairs)
+	require.Positive(t, ltPairs)
+	require.Positive(t, concurrentPairs)
+}
+
+// TestCompactKeyIsFixedWidth is the property that makes this shippable on a public API field.
+// The variable-width key reached 4020 bytes on the same input.
+func TestCompactKeyIsFixedWidth(t *testing.T) {
+	for _, s := range allTestSnapshots() {
+		require.Len(t, compactSortKey(s), compactSortKeyLength, "width varied for %s", s)
+	}
+
+	inProgress := make([]uint64, 0, 500)
+	for i := range uint64(1000) {
+		if i%2 == 0 {
+			inProgress = append(inProgress, i)
+		}
+	}
+	big := makeWellFormed(1000, inProgress)
+
+	require.Len(t, big.xipList, 500)
+	require.Len(t, compactSortKey(big), compactSortKeyLength)
+	t.Logf("%d in-progress transactions: variable key %d bytes, compact key %d bytes",
+		len(big.xipList), len(snapshotSortKey(big)), len(compactSortKey(big)))
+}
+
+// TestCompactKeyEqualSnapshotsHashIdentically is the sharp case: Equal snapshots with different
+// triples must produce byte-identical keys, which they do only because the digest is taken over
+// the canonical form rather than the raw one.
+func TestCompactKeyEqualSnapshotsHashIdentically(t *testing.T) {
+	pairs := []struct{ a, b pgSnapshot }{
+		{snap(1, 1), snap(1, 5, 1, 2, 3, 4)},
+		{snap(5, 5), snap(5, 8, 5, 6, 7)},
+		{snap(3, 3), snap(3, 6, 3, 4, 5)},
+		{snap(0, 0), snap(0, 4, 0, 1, 2, 3)},
+		{snap(0, 2, 1), snap(0, 5, 1, 2, 3, 4)},
+		{snap(10, 10), snap(0, 10)},
+	}
+
+	for _, p := range pairs {
+		t.Run(fmt.Sprintf("%s==%s", p.a, p.b), func(t *testing.T) {
+			require.True(t, p.a.Equal(p.b), "fixture is not actually Equal")
+			require.NotEqual(t, p.a, p.b, "fixture is identical, so it proves nothing")
+			require.Equal(t, compactSortKey(p.a), compactSortKey(p.b))
+		})
+	}
+}
+
+// TestCompactKeyHasNoCollisionsInTheCorpus counts distinct canonical forms against distinct keys.
+func TestCompactKeyHasNoCollisionsInTheCorpus(t *testing.T) {
+	forms := map[string]pgSnapshot{}
+	keys := map[string]pgSnapshot{}
+
+	for _, s := range allTestSnapshots() {
+		form := string(canonicalEncoding(canonicalize(s)))
+		forms[form] = s
+
+		key := string(compactSortKey(s))
+		if prev, seen := keys[key]; seen {
+			require.True(t, prev.Equal(s),
+				"COLLISION between snapshots that are not Equal: %s and %s", prev, s)
+		}
+		keys[key] = s
+	}
+
+	require.Len(t, keys, len(forms),
+		"distinct canonical forms collapsed into fewer keys, so a collision occurred")
+	t.Logf("%d distinct canonical forms produced %d distinct keys, no collisions",
+		len(forms), len(keys))
+}
+
+// TestTruncatedDigestOnlyEverCollidesIncomparablePairs is the heart of the collision argument,
+// and the reason the trade is acceptable.
+//
+// Rather than observe that 128 bits is large and hope, it shrinks the digest to ONE BYTE to force
+// collisions in a 635-snapshot corpus, then checks what actually breaks. The answer is that
+// collisions appear only between snapshots that are Equal or concurrent. No comparable pair ever
+// ties, at any digest width, because cardinality alone already separated them.
+//
+// So the failure mode of a hash collision is bounded by construction, not by probability: it can
+// reorder two snapshots that have no causal relationship, and it can never invert a real order.
+func TestTruncatedDigestOnlyEverCollidesIncomparablePairs(t *testing.T) {
+	snapshots := allTestSnapshots()
+
+	for _, digestLength := range []int{1, 2, 4, 16} {
+		t.Run(fmt.Sprintf("%d-byte-digest", digestLength), func(t *testing.T) {
+			keys := make([][]byte, len(snapshots))
+			for i, s := range snapshots {
+				keys[i] = compactSortKeyWithDigestLength(s, digestLength)
+			}
+
+			var collisions int
+			for i, a := range snapshots {
+				for j, b := range snapshots {
+					cmp := bytes.Compare(keys[i], keys[j])
+
+					switch a.compare(b) {
+					case lt:
+						require.Negative(t, cmp,
+							"a real order was broken at digest width %d: %s < %s",
+							digestLength, a, b)
+					case gt:
+						require.Positive(t, cmp,
+							"a real order was broken at digest width %d: %s > %s",
+							digestLength, a, b)
+					case equal:
+						require.Zero(t, cmp, "Equal snapshots must always tie")
+					case concurrent:
+						if cmp == 0 {
+							collisions++
+						}
+					}
+				}
+			}
+
+			t.Logf("digest width %2d bytes: %d concurrent pairs collided", digestLength, collisions)
+			if digestLength == 1 {
+				require.Positive(t, collisions,
+					"a one-byte digest over %d snapshots should collide; if it does not, this "+
+						"test is not demonstrating anything", len(snapshots))
+			}
+			if digestLength == compactDigestLength {
+				require.Zero(t, collisions, "no collision expected at the shipping width")
+			}
+		})
+	}
+}
+
+// TestCompactKeyIsATotalPreorder states precisely what the compact key guarantees, which is
+// weaker than the variable-width key's strict total order: ties are possible, but only between
+// snapshots with no causal relationship, and the relation is still transitive, so sorting is
+// well defined and cycle-free.
+func TestCompactKeyIsATotalPreorder(t *testing.T) {
+	snapshots := allTestSnapshots()
+	keys := make([][]byte, len(snapshots))
+	for i, s := range snapshots {
+		keys[i] = compactSortKey(s)
+	}
+
+	for i, a := range snapshots {
+		for j, b := range snapshots {
+			ij := bytes.Compare(keys[i], keys[j])
+			require.Equal(t, ij, -bytes.Compare(keys[j], keys[i]),
+				"not antisymmetric for %s, %s", a, b)
+
+			// A tie is permitted only where there is no order to contradict.
+			if ij == 0 {
+				require.False(t, a.LessThan(b) || a.GreaterThan(b),
+					"keys tied for a comparable pair %s, %s", a, b)
+			}
+		}
+	}
+
+	sample := snapshots
+	if len(sample) > 90 {
+		sample = sample[:90]
+	}
+	for i := range sample {
+		for j := range sample {
+			if bytes.Compare(keys[i], keys[j]) > 0 {
+				continue
+			}
+			for k := range sample {
+				if bytes.Compare(keys[j], keys[k]) > 0 {
+					continue
+				}
+				require.LessOrEqual(t, bytes.Compare(keys[i], keys[k]), 0,
+					"preorder is not transitive: %s <= %s <= %s", sample[i], sample[j], sample[k])
+			}
+		}
+	}
+}
+
+// TestCompactSortedOrderNeverContradictsThePartialOrder sorts the corpus by compact key and
+// checks the sequence, which is what a caller actually does with it.
+func TestCompactSortedOrderNeverContradictsThePartialOrder(t *testing.T) {
+	sorted := slices.Clone(allTestSnapshots())
+	slices.SortStableFunc(sorted, func(a, b pgSnapshot) int {
+		return bytes.Compare(compactSortKey(a), compactSortKey(b))
+	})
+
+	for i := range sorted {
+		for j := i + 1; j < len(sorted); j++ {
+			require.False(t, sorted[i].GreaterThan(sorted[j]),
+				"position %d holds %s which is GreaterThan %s at position %d",
+				i, sorted[i], sorted[j], j)
+		}
+	}
+	t.Logf("sorted %d snapshots by compact key, no inversion", len(sorted))
+}
+
+// TestCardinalityCannotOverflow answers whether eight bytes is enough at the top of the xid
+// range.
+//
+// Cardinality is xmax minus the number of hidden transactions, both uint64, and hidden can never
+// exceed xmax, so the result is in [0, MaxUint64] and the subtraction cannot underflow. The only
+// way to exceed the field would be for xmax itself to exceed uint64, which it cannot: Postgres
+// xid8 is a 64-bit FullTransactionId that does not wrap, which is the whole reason SpiceDB uses
+// it rather than the wrapping 32-bit xid.
+func TestCardinalityCannotOverflow(t *testing.T) {
+	max := pgSnapshot{xmin: math.MaxUint64, xmax: math.MaxUint64}
+	require.EqualValues(t, uint64(math.MaxUint64), visibleCardinality(max))
+	require.Equal(t, []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+		compactSortKey(max)[:8], "the cardinality field saturates rather than wrapping")
+
+	// One hidden transaction at the very top is one below the maximum, not a wrap to zero.
+	nearMax := pgSnapshot{
+		xmin:    math.MaxUint64 - 1,
+		xmax:    math.MaxUint64,
+		xipList: []uint64{math.MaxUint64 - 1},
+	}
+	require.EqualValues(t, uint64(math.MaxUint64)-1, visibleCardinality(nearMax))
+	require.True(t, nearMax.LessThan(max))
+	require.Negative(t, bytes.Compare(compactSortKey(nearMax), compactSortKey(max)))
+
+	// And the empty snapshot sits at the bottom without underflowing.
+	require.EqualValues(t, 0, visibleCardinality(snap(0, 0)))
+	require.Equal(t, make([]byte, 8), compactSortKey(snap(0, 0))[:8])
+}
+
+// TestCompactKeyGoldenVectors pins exact bytes. Keys may be stored durably, so the encoding can
+// never change once released; if a refactor alters the canonical form, the hash, the field order
+// or the endianness, this test is what notices.
+func TestCompactKeyGoldenVectors(t *testing.T) {
+	vectors := []struct {
+		snapshot pgSnapshot
+		want     string
+	}{
+		{snap(0, 0), "0000000000000000374708fff7719dd5979ec875d56cd228"},
+		{snap(1, 1), "0000000000000001783825822a6f9e62da2190e828e4c9d2"},
+		// Equal to the line above despite a completely different triple, so byte-identical.
+		{snap(1, 5, 1, 2, 3, 4), "0000000000000001783825822a6f9e62da2190e828e4c9d2"},
+		{snap(0, 4, 2), "0000000000000003c5fc36f5fdc9e58c969a372f4d52a873"},
+		{snap(123, 456, 124, 126, 168), "00000000000001c5eff36a835d00f1e06797bdf06bdcdcf7"},
+		{snap(10, 20, 12, 15, 18), "0000000000000011598b48f943f01f513debcc8c1ecfff33"},
+		// Top of the xid range: the cardinality field saturates at all-ones, it does not wrap.
+		{pgSnapshot{xmin: math.MaxUint64, xmax: math.MaxUint64},
+			"ffffffffffffffff60c69a3e87bf5c4f1e546bec45f26269"},
+	}
+
+	for _, v := range vectors {
+		got := hex.EncodeToString(compactSortKey(v.snapshot))
+		require.Equal(t, v.want, got, "golden vector changed for %s", v.snapshot)
+		require.Len(t, got, compactSortKeyLength*2)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // The revision level, which is where a ZedToken actually operates
 // ---------------------------------------------------------------------------
 
@@ -1085,6 +1487,19 @@ func encodableAsRevisionProto(s pgSnapshot) bool {
 // It is not reachable in practice - a Postgres xid8 counter would have to pass 2^63 - but it
 // matters to this investigation because any scheme that computes a sort key at token-issue time
 // runs on exactly this code path.
+//
+// WHAT IT WOULD TAKE TO FIX, for whoever implements the sort key. MarshalBinary encodes xmax and
+// each xip as a signed offset from xmin so that protobuf varints stay short for the common case
+// where the three are close together. The offsets are genuinely signed - an xip is always above
+// xmin, but relative_xmax is computed as xmax-xmin and the proto field is int64 - so the fix is
+// not simply widening to uint64. The honest options are to add a uint64 absolute-value field
+// alongside the relative one and prefer it when the relative encoding would overflow, or to
+// change MarshalBinary to return its error instead of calling MustBugf and let String() surface
+// it, which changes a widely used signature. Either is a self-contained change with its own wire
+// or API consequences, so it belongs in a separate PR from the sort key, and it is not urgent:
+// no deployment can reach xid 2^63. The reason to track it at all is that the sort key moves
+// this code from "called when someone serialises a revision" to "called on every token issue",
+// so a panic there becomes a request-path panic rather than a debugging inconvenience.
 func TestRevisionStringPanicsOnExtremeXids(t *testing.T) {
 	extreme := postgresRevision{snapshot: snap(1<<63, 1<<63)}
 	require.Panics(t, func() { _ = extreme.String() },
@@ -1132,6 +1547,46 @@ func FuzzSortKeyIsALinearExtension(f *testing.F) {
 			require.Zero(t, cmp, "Equal but keys differ: %s, %s", a, b)
 		case concurrent:
 			require.NotZero(t, cmp, "concurrent but keys collide: %s, %s", a, b)
+		}
+	})
+}
+
+// FuzzCompactSortKeyIsALinearExtension is the fuzz target for the shippable 24-byte key.
+//
+// Note the concurrent case is deliberately NOT asserted to differ. The compact key is a total
+// PREORDER: two concurrent snapshots are permitted to collide, and asserting otherwise would be
+// asserting that SHA-256 never collides. What must hold, and is asserted, is that no COMPARABLE
+// pair ever ties or inverts.
+func FuzzCompactSortKeyIsALinearExtension(f *testing.F) {
+	f.Add(uint64(4), uint64(0b0100), uint64(4), uint64(0b1100))
+	f.Add(uint64(0), uint64(0), uint64(1), uint64(0))
+	f.Add(uint64(5), uint64(0b11111), uint64(5), uint64(0))
+	f.Add(uint64(12), uint64(0b101010101010), uint64(12), uint64(0b010101010101))
+	f.Add(uint64(40), uint64(1)<<39, uint64(40), uint64(0))
+
+	f.Fuzz(func(t *testing.T, xmaxA, maskA, xmaxB, maskB uint64) {
+		xmaxA %= bruteForceUniverse + 1
+		xmaxB %= bruteForceUniverse + 1
+
+		a := snapshotFromMask(xmaxA, maskA)
+		b := snapshotFromMask(xmaxB, maskB)
+
+		keyA, keyB := compactSortKey(a), compactSortKey(b)
+		require.Len(t, keyA, compactSortKeyLength)
+		require.Len(t, keyB, compactSortKeyLength)
+
+		cmp := bytes.Compare(keyA, keyB)
+		switch a.compare(b) {
+		case lt:
+			require.Negative(t, cmp, "LessThan but key not less: %s, %s", a, b)
+			require.Less(t, visibleCardinality(a), visibleCardinality(b),
+				"cardinality failed to separate a comparable pair: %s, %s", a, b)
+		case gt:
+			require.Positive(t, cmp, "GreaterThan but key not greater: %s, %s", a, b)
+			require.Greater(t, visibleCardinality(a), visibleCardinality(b),
+				"cardinality failed to separate a comparable pair: %s, %s", a, b)
+		case equal:
+			require.Zero(t, cmp, "Equal but keys differ: %s, %s", a, b)
 		}
 	})
 }
