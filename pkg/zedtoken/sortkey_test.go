@@ -18,10 +18,16 @@ import (
 
 const testDatastoreID = "6349aaf2-37cd-47b9-84e8-fe5fa6e2dead"
 
-// unsortableRevision stands in for a Postgres revision: a datastore.Revision that deliberately
-// does not implement datastore.SortKeyRevision, because snapshots are only partially ordered. The
-// postgres package is not imported here - the point is the absence of a method, and a local type
-// demonstrates that just as well without dragging a datastore implementation into this package.
+// unsortableRevision is a datastore.Revision that does not implement datastore.SortKeyRevision.
+//
+// No datastore SpiceDB ships produces such a revision any more. Postgres was the last one, and it
+// gained a sort key once it became clear that a key only has to avoid contradicting the partial
+// order rather than reproduce it. What is left in the tree is datastore.NoRevision.
+//
+// The tests below are therefore defending a contract rather than describing a datastore: a
+// revision type may decline the capability, and when one does, the zedtoken API must say so with
+// ErrNotSortable instead of inventing an order. A local type states that contract without
+// depending on some real datastore continuing to decline it.
 type unsortableRevision uint64
 
 func (ur unsortableRevision) ByteSortable() bool { return false }

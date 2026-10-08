@@ -17,18 +17,18 @@ import (
 const errSortKeyError = "error computing zedtoken sort key: %w"
 
 var (
-	// ErrNotSortable is returned when the revision carried by a zedtoken is of a type that is only
-	// partially ordered, and so has no sort key. It is a property of the datastore's revision type,
-	// not of the individual token: every token from such a datastore reports it, and no token from
-	// a totally ordered datastore ever does.
+	// ErrNotSortable is returned when the revision carried by a zedtoken is of a type that has no
+	// sort key, because it does not implement datastore.SortKeyRevision.
 	//
-	// Postgres is the case that exists today. Its revisions are transaction snapshots, and two
-	// snapshots can be mutually uncomparable - neither before nor after the other - so there is no
-	// order for bytes to preserve. See datastore.SortKeyRevision.
+	// No datastore SpiceDB currently ships returns this. Every revision type in the tree - Postgres
+	// snapshots, hybrid logical clocks, timestamps and transaction IDs - implements the interface.
+	// Postgres was the exception until its revisions gained a sort key: snapshots are only partially
+	// ordered, but a key only has to avoid contradicting that order, and such a key exists.
 	//
-	// Callers that must cope with any datastore should treat this as "sorting is unavailable here"
-	// rather than as a failure of the token.
-	ErrNotSortable = errors.New("zedtoken revision type is only partially ordered and has no sort key")
+	// It remains reachable for datastore.NoRevision, and it is the contract for any future revision
+	// type that declines the capability, so callers that must cope with any datastore should keep
+	// treating it as "sorting is unavailable here" rather than as a failure of the token.
+	ErrNotSortable = errors.New("zedtoken revision type has no sort key")
 
 	// ErrDatastoreIDMismatch is returned when a zedtoken carries a datastore unique ID that does
 	// not match the datastore it is being sorted against. Sort keys order revisions only within a
@@ -61,8 +61,8 @@ var (
 //
 // Errors:
 //
-//   - ErrNotSortable, via errors.Is, when the datastore's revisions are only partially ordered.
-//     Postgres is the case that exists today.
+//   - ErrNotSortable, via errors.Is, when the revision type does not implement
+//     datastore.SortKeyRevision. No datastore SpiceDB currently ships does this.
 //   - ErrDatastoreIDMismatch, via errors.Is, when the token names a different datastore.
 //   - A decode error for a nil, malformed or unrecognized token.
 //
