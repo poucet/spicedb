@@ -634,7 +634,6 @@ func TestCanonicalXmaxIsMonotoneButRawXmaxIsNot(t *testing.T) {
 		require.Positive(t, checked)
 		t.Logf("canonical xmax non-decreasing across %d ordered pairs", checked)
 	})
-
 }
 
 // ---------------------------------------------------------------------------
