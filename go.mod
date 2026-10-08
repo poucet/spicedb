@@ -263,3 +263,8 @@ require (
 	golang.org/x/tools v0.50.0 // indirect
 	google.golang.org/genproto v0.0.0-20260729162451-8efbd57d26e0 // indirect
 )
+
+// PROTOTYPE ONLY. Points at a local checkout of authzed-go carrying the proposed
+// `bytes sort_key = 2` field on authzed.api.v1.ZedToken. Drop this once authzed/api
+// ships the field and authzed-go is regenerated from it.
+replace github.com/authzed/authzed-go => /Users/christophe.poucet/projects/zanzibar/authzed-go
