@@ -112,7 +112,47 @@ func newFromRevision(revision datastore.Revision, datastoreUniqueID string, sche
 	// order-preserving encoding of it.
 	encoded.SortKey = sortKeyFor(revision)
 
+	// And the visible set, for the causal question the sort key cannot answer. Same reason it
+	// cannot be done in Encode: it needs the revision, not a string of it.
+	encoded.Visibility = visibilityFor(revision)
+
 	return encoded, nil
+}
+
+// visibilityFor returns the description of which writes are visible at revision, to be carried on
+// the token as ZedToken.visibility, or nil when the revision's type has no need of it.
+//
+// Only a PARTIALLY ordered revision type sets this, and only PostgreSQL is one today. For a
+// totally ordered type the visible set grows monotonically, so comparing sort keys already answers
+// the causal question exactly, and shipping a visible set as well would be redundant bytes on
+// every response. Absence is therefore meaningful rather than merely empty: it tells a client that
+// sort_key alone is a sound basis for deciding what happened after what.
+//
+// ⚠️ This is the only unbounded field on a token. It carries one exception per write transaction
+// in flight when the revision was taken. TestVisibilitySizeScalesWithWritesInFlight measures it.
+//
+// Like sortKeyFor, a revision type that declines the capability is NOT an error. Token issuance
+// must never fail because an optional interface is unimplemented.
+func visibilityFor(revision datastore.Revision) *v1.RevisionVisibility {
+	vr, ok := revision.(datastore.VisibilityRevision)
+	if !ok {
+		return nil
+	}
+
+	visible := vr.VisibleSet()
+
+	// Offsets from the floor, so the varints stay small: an in-flight transaction is near the top
+	// of the range, and its absolute sequence can be a 64-bit number while its offset is tiny.
+	offsets := make([]uint64, 0, len(visible.Exceptions))
+	for _, exception := range visible.Exceptions {
+		offsets = append(offsets, exception-visible.Floor)
+	}
+
+	return &v1.RevisionVisibility{
+		Floor:            visible.Floor,
+		Ceiling:          visible.Ceiling,
+		ExceptionOffsets: offsets,
+	}
 }
 
 // sortKeyFor returns the order-preserving bytes for revision, to be carried on the token as

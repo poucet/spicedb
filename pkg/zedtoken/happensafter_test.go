@@ -89,6 +89,42 @@ func (sr setRevision) GreaterThan(rhs datastore.Revision) bool {
 
 func (sr setRevision) ByteSortable() bool { return true }
 
+// VisibleSet projects the explicit set into the range-with-holes form, so the generic
+// datastore.VisibleSet.Dominates rule can be checked against this type's own Dominates.
+//
+// The set is arbitrary rather than an interval, so the projection takes floor 0 and a ceiling one
+// past the largest member, and punches out everything in between that is absent. That is the
+// worst case for the encoding and exactly what makes it a useful cross-check.
+func (sr setRevision) VisibleSet() datastore.VisibleSet {
+	if len(sr.visible) == 0 {
+		return datastore.VisibleSet{}
+	}
+
+	ceiling := sr.visible[len(sr.visible)-1] + 1
+	var exceptions []uint64
+	for candidate := uint64(0); candidate < ceiling; candidate++ {
+		if !sr.contains(candidate) {
+			exceptions = append(exceptions, candidate)
+		}
+	}
+
+	return datastore.VisibleSet{Floor: 0, Ceiling: ceiling, Exceptions: exceptions}
+}
+
+// TestSetRevisionProjectionAgreesWithDominates guards the fixture itself: if the fake's
+// projection and its Dominates ever disagree, every test built on the lattice is suspect.
+func TestSetRevisionProjectionAgreesWithDominates(t *testing.T) {
+	allSettled, sees3, sees2, twoInFlight := latticeRevisions()
+	all := []setRevision{allSettled, sees3, sees2, twoInFlight, newSetRevision(), newSetRevision(9)}
+
+	for _, a := range all {
+		for _, b := range all {
+			require.Equal(t, a.Dominates(b), a.VisibleSet().Dominates(b.VisibleSet()),
+				"projection disagreed with Dominates for a=%s b=%s", a, b)
+		}
+	}
+}
+
 var (
 	_ datastore.Revision           = setRevision{}
 	_ datastore.VisibilityRevision = setRevision{}
